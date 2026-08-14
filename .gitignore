@@ -1,0 +1,18 @@
+# .NET / Visual Studio ビルド成果物
+bin/
+obj/
+*.user
+.vs/
+
+# APIキーなど秘密情報(.env.exampleだけコミットする)
+.env
+
+# Whisperモデルファイル(数百MB〜数GBあるため、Gitではなく各自でダウンロードする運用にする)
+ggml-*.bin
+
+# 録音した音声ファイル(テスト時に生成されたもの)
+*.wav
+
+# OS/エディタ関連
+.DS_Store
+Thumbs.db

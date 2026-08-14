@@ -1,0 +1,59 @@
+<Window x:Class="LoopbackRecorder.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="訳文オーバーレイ"
+        Width="500" Height="160"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="CanResizeWithGrip"
+        MouseLeftButtonDown="Window_MouseLeftButtonDown">
+    <Grid>
+        <!-- 半透明の背景。ゲーム画面が透けて見えるようにする -->
+        <Border Background="#B0000000" CornerRadius="8" BorderBrush="#55FFFFFF" BorderThickness="1">
+            <Grid Margin="12">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- 上部のつまみ部分(ドラッグ移動・閉じるボタン用)。ゲーム上での誤操作を避けるため最小限に -->
+                <Grid Grid.Row="0" Margin="0,0,0,4">
+                    <TextBlock Text="⠿⠿⠿" Foreground="#66FFFFFF" FontSize="10" HorizontalAlignment="Left"/>
+                    <Button x:Name="CloseButton" Content="✕" Width="20" Height="20" Padding="0"
+                            HorizontalAlignment="Right" Background="Transparent" Foreground="#AAFFFFFF"
+                            BorderThickness="0" Click="CloseButton_Click"/>
+                </Grid>
+
+                <!-- 訳文本体(複数行を履歴として積み上げ、最新行が見えるよう自動スクロールする) -->
+                <ListBox Grid.Row="1" x:Name="TranslatedListBox"
+                         Background="Transparent" BorderThickness="0"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Hidden">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="Background" Value="Transparent"/>
+                            <Setter Property="Focusable" Value="False"/>
+                            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ListBoxItem">
+                                        <ContentPresenter/>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding}" Foreground="White" FontSize="22" FontWeight="Bold"
+                                       TextWrapping="Wrap" TextAlignment="Center" Margin="0,2"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
