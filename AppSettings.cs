@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 /// <summary>
 /// アプリの設定値をまとめて保持するクラス。
@@ -28,6 +30,10 @@ public class AppSettings
 
     /// <summary>ONの場合、VAD閾値を引き上げ、小さい雑音より大きいゲーム音声を優先的に拾うようにする</summary>
     public bool GameAudioPriorityMode { get; set; } = false;
+
+    /// <summary>ゲーム音声優先モードON時にVAD閾値へ掛ける倍率。
+    /// 以前は1.5固定でUIから調整できなかったため、設定画面から変更できるようにした。</summary>
+    public float GameAudioPriorityMultiplier { get; set; } = 1.5f;
 
     public double OverlayFontSize { get; set; } = 22;
     public double OverlayOpacity { get; set; } = 0.7;
@@ -62,14 +68,16 @@ public class AppSettings
             WhisperModelPath = Environment.GetEnvironmentVariable("WHISPER_MODEL_PATH") ?? "ggml-base.bin",
         };
 
+        // .envのような設定ファイルはOSのカルチャ(小数点がカンマになる地域設定等)に
+        // 影響されると壊れるため、数値の読み書きは必ずInvariantCultureで行う
         var vadThresholdStr = Environment.GetEnvironmentVariable("VAD_THRESHOLD");
-        if (float.TryParse(vadThresholdStr, out var vadThreshold))
+        if (float.TryParse(vadThresholdStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vadThreshold))
         {
             settings.VadThreshold = vadThreshold;
         }
 
         var vadHysteresisStr = Environment.GetEnvironmentVariable("VAD_HYSTERESIS_RATIO");
-        if (float.TryParse(vadHysteresisStr, out var vadHysteresisRatio))
+        if (float.TryParse(vadHysteresisStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vadHysteresisRatio))
         {
             settings.VadHysteresisRatio = vadHysteresisRatio;
         }
@@ -78,11 +86,18 @@ public class AppSettings
         {
             settings.GameAudioPriorityMode = priorityMode;
         }
-        if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_FONT_SIZE"), out var fontSize))
+        if (float.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER"),
+                NumberStyles.Float, CultureInfo.InvariantCulture, out var priorityMultiplier))
+        {
+            settings.GameAudioPriorityMultiplier = priorityMultiplier;
+        }
+        if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_FONT_SIZE"),
+                NumberStyles.Float, CultureInfo.InvariantCulture, out var fontSize))
         {
             settings.OverlayFontSize = fontSize;
         }
-        if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_OPACITY"), out var opacity))
+        if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_OPACITY"),
+                NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity))
         {
             settings.OverlayOpacity = opacity;
         }
@@ -93,16 +108,45 @@ public class AppSettings
         settings.WhisperPrompt = Environment.GetEnvironmentVariable("WHISPER_PROMPT") ?? "";
         settings.RecognitionLanguage = Environment.GetEnvironmentVariable("RECOGNITION_LANGUAGE") ?? "auto";
         settings.TargetLanguageCode = Environment.GetEnvironmentVariable("TARGET_LANGUAGE_CODE") ?? "JA";
-        settings.OllamaContext = (Environment.GetEnvironmentVariable("OLLAMA_CONTEXT") ?? "").Replace("\\n", "\n");
+        // 改行のエスケープ(\n → 改行)はEnvLoader側で共通処理済み
+        settings.OllamaContext = Environment.GetEnvironmentVariable("OLLAMA_CONTEXT") ?? "";
+        settings.OllamaEndpoint = NormalizeEndpoint(settings.OllamaEndpoint);
 
         return settings;
+    }
+
+    /// <summary>
+    /// Ollamaエンドポイントの入力ゆれを吸収する。
+    /// 末尾に"/"が付いていると、呼び出し側で"{endpoint}/api/generate"のように連結した際に
+    /// "//"の二重スラッシュになってしまうことがあるため、末尾のスラッシュを正規化する。
+    /// URIとして解釈できない値はそのまま返す(呼び出し時のHTTPエラーで気づける)。
+    /// </summary>
+    private static string NormalizeEndpoint(string endpoint)
+    {
+        var trimmed = (endpoint ?? "").Trim();
+        if (trimmed.Length == 0) return trimmed;
+
+        trimmed = trimmed.TrimEnd('/');
+
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) &&
+            (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        {
+            return trimmed;
+        }
+
+        // http/httpsとして妥当でない場合は変更せずそのまま返す
+        return trimmed;
     }
 
     /// <summary>現在の設定を.envファイルに書き戻す(キー以外の項目も含めて保存する)</summary>
     public void SaveToEnv()
     {
-        // .envは1行=1設定の形式なので、複数行になりうる参考コンテキストは改行をエスケープする
+        // .envは1行=1設定の形式なので、複数行になりうる値は改行をエスケープする。
+        // WHISPER_PROMPTはUIのTextBox自体はAcceptsReturn=Falseだが、貼り付けで
+        // 改行が入るケースもあるため、参考コンテキストと同様にエスケープしておく
         var escapedContext = OllamaContext.Replace("\r\n", "\n").Replace("\n", "\\n");
+        var escapedPrompt = WhisperPrompt.Replace("\r\n", "\n").Replace("\n", "\\n");
+        OllamaEndpoint = NormalizeEndpoint(OllamaEndpoint);
 
         var lines = new List<string>
         {
@@ -113,25 +157,28 @@ public class AppSettings
             $"DEVICE_ID={DeviceId}",
             "",
             "# VAD(発話検出)の閾値",
-            $"VAD_THRESHOLD={VadThreshold}",
+            $"VAD_THRESHOLD={VadThreshold.ToString(CultureInfo.InvariantCulture)}",
             "",
             "# VADヒステリシス比率(0〜1)。発話継続中の判定閾値をVAD_THRESHOLDからどれだけ下げるか。",
             "# 小さいほど、息継ぎ等の短い音量低下でセグメントが分断されにくくなる",
-            $"VAD_HYSTERESIS_RATIO={VadHysteresisRatio}",
+            $"VAD_HYSTERESIS_RATIO={VadHysteresisRatio.ToString(CultureInfo.InvariantCulture)}",
             "",
             "# ゲーム音声優先モード(小さい雑音より大きい音声を優先的に拾う)",
             $"GAME_AUDIO_PRIORITY_MODE={GameAudioPriorityMode}",
             "",
+            "# ゲーム音声優先モードON時にVAD閾値へ掛ける倍率(大きいほど小さい音を拾わなくなる)",
+            $"GAME_AUDIO_PRIORITY_MULTIPLIER={GameAudioPriorityMultiplier.ToString(CultureInfo.InvariantCulture)}",
+            "",
             "# オーバーレイの見た目",
-            $"OVERLAY_FONT_SIZE={OverlayFontSize}",
-            $"OVERLAY_OPACITY={OverlayOpacity}",
+            $"OVERLAY_FONT_SIZE={OverlayFontSize.ToString(CultureInfo.InvariantCulture)}",
+            $"OVERLAY_OPACITY={OverlayOpacity.ToString(CultureInfo.InvariantCulture)}",
             $"OVERLAY_MAX_LINES={OverlayMaxLines}",
             "",
             "# 使用するWhisperモデルファイル名",
             $"WHISPER_MODEL_PATH={WhisperModelPath}",
             "",
-            "# Whisperに渡す認識ヒント(固有名詞など。カンマ区切りで自由に記述)",
-            $"WHISPER_PROMPT={WhisperPrompt}",
+            "# Whisperに渡す認識ヒント(固有名詞など。カンマ区切りで自由に記述。改行は\\nでエスケープ済み)",
+            $"WHISPER_PROMPT={escapedPrompt}",
             "",
             "# 認識言語(Whisperコード。例: auto, en, ja, ko, zh)",
             $"RECOGNITION_LANGUAGE={RecognitionLanguage}",
@@ -155,16 +202,21 @@ public class AppSettings
             $"OLLAMA_CONTEXT={escapedContext}",
         };
 
-        File.WriteAllLines(EnvPath, lines);
+        // APIキーを含む設定ファイルなので、書き込み途中のクラッシュ/電源断で内容が
+        // 中途半端になるのを避けるため、一時ファイルに書いてから置き換える(アトミック寄りの保存)
+        var tempPath = EnvPath + ".tmp";
+        File.WriteAllLines(tempPath, lines, Encoding.UTF8);
+        File.Move(tempPath, EnvPath, overwrite: true);
 
         // 実行中のプロセスにもすぐ反映されるよう環境変数も更新する
         Environment.SetEnvironmentVariable("DEVICE_KEYWORD", DeviceKeyword);
         Environment.SetEnvironmentVariable("DEVICE_ID", DeviceId);
-        Environment.SetEnvironmentVariable("VAD_THRESHOLD", VadThreshold.ToString());
-        Environment.SetEnvironmentVariable("VAD_HYSTERESIS_RATIO", VadHysteresisRatio.ToString());
+        Environment.SetEnvironmentVariable("VAD_THRESHOLD", VadThreshold.ToString(CultureInfo.InvariantCulture));
+        Environment.SetEnvironmentVariable("VAD_HYSTERESIS_RATIO", VadHysteresisRatio.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE", GameAudioPriorityMode.ToString());
-        Environment.SetEnvironmentVariable("OVERLAY_FONT_SIZE", OverlayFontSize.ToString());
-        Environment.SetEnvironmentVariable("OVERLAY_OPACITY", OverlayOpacity.ToString());
+        Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER", GameAudioPriorityMultiplier.ToString(CultureInfo.InvariantCulture));
+        Environment.SetEnvironmentVariable("OVERLAY_FONT_SIZE", OverlayFontSize.ToString(CultureInfo.InvariantCulture));
+        Environment.SetEnvironmentVariable("OVERLAY_OPACITY", OverlayOpacity.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("OVERLAY_MAX_LINES", OverlayMaxLines.ToString());
         Environment.SetEnvironmentVariable("WHISPER_MODEL_PATH", WhisperModelPath);
         Environment.SetEnvironmentVariable("WHISPER_PROMPT", WhisperPrompt);

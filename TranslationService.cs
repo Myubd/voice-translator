@@ -195,9 +195,10 @@ public class OllamaTranslationService : ITranslationService
     /// Ollamaにインストール済みのモデル名一覧を取得する(設定画面のドロップダウン用)。
     /// Ollamaが起動していない場合は空リストを返す。
     /// </summary>
-    public static async Task<List<string>> GetInstalledModelsAsync(HttpClient httpClient, string endpoint)
+    public static async Task<List<string>> GetInstalledModelsAsync(
+        HttpClient httpClient, string endpoint, CancellationToken cancellationToken = default)
     {
-        using var response = await httpClient.GetAsync($"{endpoint}/api/tags");
+        using var response = await httpClient.GetAsync($"{endpoint}/api/tags", cancellationToken);
         response.EnsureSuccessStatusCode();
 
         var json = await response.Content.ReadAsStringAsync();

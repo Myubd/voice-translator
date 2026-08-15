@@ -1,6 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -10,7 +12,15 @@ namespace LoopbackRecorder;
 public partial class SettingsWindow : Window
 {
     public AppSettings Settings { get; private set; }
+
+    // MainWindow側とは別に、この設定画面専用のHttpClientを持つ(Ollamaのモデル一覧取得用)。
+    // 設定画面を開閉するたびに新しいHttpClientを作っていた従来の実装ではリソースが積み上がるため、
+    // インスタンスを1つだけ保持し、ウィンドウが閉じるタイミングで確実にDisposeする
     private readonly HttpClient _httpClient = new HttpClient();
+
+    // Ollamaのモデル一覧取得は、Ollama自体が応答しない場合に長時間ぶら下がる可能性がある。
+    // 設定画面を閉じたのにリクエストだけ裏で残り続けないよう、Closingでキャンセルできるようにする
+    private CancellationTokenSource? _ollamaLoadCts;
 
     // DeepL APIキーはPasswordBox/TextBoxを表示切り替えで共有するため、値そのものはここで一元管理する
     private string _deepLApiKey = "";
@@ -33,9 +43,13 @@ public partial class SettingsWindow : Window
             d => d.Name.Contains(Settings.DeviceKeyword, System.StringComparison.OrdinalIgnoreCase));
         DeviceComboBox.SelectedItem = matchedDevice ?? devices.FirstOrDefault();
 
-        // Whisperモデルファイル(ggml-*.bin)を自動検出してドロップダウンに反映
-        var modelFiles = System.IO.Directory.Exists(".")
-            ? System.IO.Directory.GetFiles(".", "ggml-*.bin").Select(System.IO.Path.GetFileName).ToList()
+        // Whisperモデルファイル(ggml-*.bin)を自動検出してドロップダウンに反映。
+        // 実行ファイルの場所を基準に探索する(AudioPipelineのモデルパス解決と揃える)。
+        // 以前はカレントディレクトリ(".")基準だったため、exeをどこから起動したかによって
+        // AudioPipeline側の実際の探索結果とここでの一覧表示がずれることがあった
+        var modelDirectory = AppContext.BaseDirectory;
+        var modelFiles = System.IO.Directory.Exists(modelDirectory)
+            ? System.IO.Directory.GetFiles(modelDirectory, "ggml-*.bin").Select(System.IO.Path.GetFileName).ToList()
             : new List<string?>();
         foreach (var file in modelFiles)
         {
@@ -60,6 +74,7 @@ public partial class SettingsWindow : Window
         VadThresholdSlider.Value = Settings.VadThreshold;
         VadHysteresisSlider.Value = Settings.VadHysteresisRatio;
         GameAudioPriorityCheckBox.IsChecked = Settings.GameAudioPriorityMode;
+        GameAudioPriorityMultiplierSlider.Value = Settings.GameAudioPriorityMultiplier;
         OverlayFontSizeSlider.Value = Settings.OverlayFontSize;
         OverlayOpacitySlider.Value = Settings.OverlayOpacity;
         OverlayMaxLinesSlider.Value = Settings.OverlayMaxLines;
@@ -79,18 +94,43 @@ public partial class SettingsWindow : Window
 
         UpdateBackendPanelsVisibility();
         _ = LoadOllamaModelsAsync();
+
+        Closed += SettingsWindow_Closed;
+    }
+
+    private void SettingsWindow_Closed(object? sender, EventArgs e)
+    {
+        // 設定画面を閉じた後もOllamaへのリクエストが裏で残り続けないようキャンセルし、
+        // このウィンドウ専用のHttpClientも解放する
+        _ollamaLoadCts?.Cancel();
+        _ollamaLoadCts?.Dispose();
+        _httpClient.Dispose();
     }
 
     /// <summary>Ollamaにインストール済みのモデル一覧を取得し、ドロップダウンに反映する</summary>
     private async Task LoadOllamaModelsAsync()
     {
         StatusText.Text = "";
+
+        // Ollamaが応答しない場合に無期限に待たされないよう、タイムアウトを設ける。
+        // また設定画面を閉じた場合はこのリクエストごとキャンセルする
+        _ollamaLoadCts?.Cancel();
+        _ollamaLoadCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
         List<string> models;
         try
         {
-            models = await OllamaTranslationService.GetInstalledModelsAsync(_httpClient, OllamaEndpointTextBox.Text);
+            models = await OllamaTranslationService.GetInstalledModelsAsync(
+                _httpClient, OllamaEndpointTextBox.Text, _ollamaLoadCts.Token);
         }
-        catch (System.Exception ex)
+        catch (OperationCanceledException)
+        {
+            // ウィンドウを閉じた、またはタイムアウトした場合。閉じた後ならUI更新は不要
+            if (!IsLoaded) return;
+            StatusText.Text = "Ollamaへの接続がタイムアウトしました。Ollamaが起動しているか確認してください。";
+            return;
+        }
+        catch (Exception ex)
         {
             Logger.Log("SettingsWindow", "Ollamaモデル一覧の取得に失敗しました。", ex);
             StatusText.Text = $"Ollamaのモデル一覧を取得できませんでした: {ex.Message}";
@@ -195,6 +235,7 @@ public partial class SettingsWindow : Window
         Settings.VadThreshold = (float)VadThresholdSlider.Value;
         Settings.VadHysteresisRatio = (float)VadHysteresisSlider.Value;
         Settings.GameAudioPriorityMode = GameAudioPriorityCheckBox.IsChecked == true;
+        Settings.GameAudioPriorityMultiplier = (float)GameAudioPriorityMultiplierSlider.Value;
         Settings.OverlayFontSize = OverlayFontSizeSlider.Value;
         Settings.OverlayOpacity = OverlayOpacitySlider.Value;
         Settings.OverlayMaxLines = (int)OverlayMaxLinesSlider.Value;

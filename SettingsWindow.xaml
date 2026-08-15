@@ -117,7 +117,21 @@
                                    Style="{StaticResource HelpText}"/>
 
                         <CheckBox x:Name="GameAudioPriorityCheckBox" Content="ゲーム音声優先モード(小さい雑音より大きい音声を優先)"
-                                  Foreground="#cccccc" Margin="0,0,0,16"/>
+                                  Foreground="#cccccc" Margin="0,0,0,8"/>
+
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="優先モードの倍率(VAD閾値に掛ける値)" Style="{StaticResource FieldLabel}"/>
+                            <TextBlock Grid.Column="1" Foreground="#4da6ff" FontWeight="Bold"
+                                       Text="{Binding ElementName=GameAudioPriorityMultiplierSlider, Path=Value, StringFormat='{}{0:F1}倍'}"/>
+                        </Grid>
+                        <Slider x:Name="GameAudioPriorityMultiplierSlider" Minimum="1.0" Maximum="3.0" TickFrequency="0.1"
+                                Value="1.5" IsMoveToPointEnabled="True" Margin="0,0,0,4"/>
+                        <TextBlock Text="以前は1.5倍固定でしたが、環境によって最適な倍率が異なるためここで調整できるようにしました。大きくするほど小さい音(ボイスチャットや環境音を含む)を拾わなくなります"
+                                   Style="{StaticResource HelpText}"/>
                     </StackPanel>
                 </ScrollViewer>
 
@@ -264,7 +278,13 @@
                     <TextBlock Text="ゲーム音声リアルタイム翻訳" FontSize="18" FontWeight="Bold" Foreground="White" Margin="0,0,0,8"/>
                     <TextBlock Text="Whisper.net(音声認識) + DeepL API / Ollama(翻訳)を組み合わせた個人開発アプリです。"
                                Foreground="#aaaaaa" TextWrapping="Wrap" Margin="0,0,0,16"/>
-                    <TextBlock Text="リポジトリ: github.com/Myubd/voice-translator" Foreground="#4da6ff"/>
+                    <TextBlock Text="リポジトリ: github.com/Myubd/voice-translator" Foreground="#4da6ff" Margin="0,0,0,16"/>
+
+                    <TextBlock Text="ショートカットキー" Style="{StaticResource SectionLabel}"/>
+                    <TextBlock Text="Ctrl+Alt+R: 翻訳の開始/停止" Foreground="#cccccc" Margin="0,0,0,2"/>
+                    <TextBlock Text="Ctrl+Alt+O: オーバーレイの表示切り替え" Foreground="#cccccc" Margin="0,0,0,2"/>
+                    <TextBlock Text="ゲームがアクティブな状態でも動作します(他アプリと同じ組み合わせが既に使われている場合は動作しないことがあります)"
+                               Style="{StaticResource HelpText}"/>
                 </StackPanel>
             </Grid>
         </Border>

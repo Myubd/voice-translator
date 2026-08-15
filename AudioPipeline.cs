@@ -25,6 +25,14 @@ public class AudioPipeline
     const int MaxSpeechChunks = 500;         // 約15秒で強制的に区切る
     const int PrerollChunks = 13;            // 発話開始前の約390msを先頭に付与し、頭切れを防ぐ
 
+    // 15秒の強制分割が発生した際、次のセグメントの先頭に引き継ぐ音声の長さ(約300ms)。
+    // 何も引き継がないと、分割位置で文がぶつ切りになり、Whisperが文脈(直前の語尾)を
+    // 失ったまま次のセグメントの認識を始めることになるため、少しだけ重複させて渡す
+    const int ForcedSplitOverlapChunks = 10;
+
+    // 音声セグメント用チャンネルの最大件数。DropOldestで溢れた分の検出にも使う
+    const int SegmentChannelCapacity = 5;
+
     public float EnergyThreshold { get; set; } = 0.015f;
 
     /// <summary>
@@ -46,6 +54,13 @@ public class AudioPipeline
     /// <summary>翻訳API呼び出しが失敗した際に通知される(APIキー誤り、レート制限、ネットワーク断など)。
     /// 従来はConsole.WriteLineのみで、配布したWPFアプリではユーザーから見えなかった。</summary>
     public event Action<string>? TranslationErrorOccurred;
+
+    /// <summary>処理が追いつかず、音声セグメントがキューから古い順に破棄された際に通知される
+    /// (破棄された累計件数を渡す)。従来はDropOldestで静かに捨てるだけで、ユーザーからは
+    /// 「なぜか一部の発話が翻訳されない」としか見えなかった。</summary>
+    public event Action<int>? SegmentsDropped;
+
+    private int _droppedSegmentCount = 0;
 
     private WhisperProcessor? _processor;
     private ITranslationService? _translationService;
@@ -185,10 +200,11 @@ public class AudioPipeline
         // 発話が連続すると処理待ちが溜まっていくため、キューに上限を設ける。
         // 上限を超えたら「一番古い(=もう鮮度が落ちている)」セグメントを捨てて、
         // 遅延がどこまでも蓄積し続けるのを防ぐ
-        var segmentChannel = Channel.CreateBounded<float[]>(new BoundedChannelOptions(5)
+        var segmentChannel = Channel.CreateBounded<float[]>(new BoundedChannelOptions(SegmentChannelCapacity)
         {
             FullMode = BoundedChannelFullMode.DropOldest
         });
+        _droppedSegmentCount = 0;
 
         // Whisperの文字起こし結果を翻訳ワーカーへ渡すための第2キュー。
         // これによりWhisper自体は翻訳の完了を待たずに次のセグメントへ進める
@@ -256,14 +272,28 @@ public class AudioPipeline
                     bool silenceLongEnough = silenceChunkCount >= SilenceChunksToEndSpeech;
                     bool tooLong = speechBuffer.Count / ChunkSamples >= MaxSpeechChunks;
 
-                    if (silenceLongEnough || tooLong)
+                    if (silenceLongEnough)
                     {
+                        // 無音による自然な発話終了。プリロールと同様、この後は非発話状態に戻る
                         inSpeech = false;
                         if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
                         {
-                            segmentChannel.Writer.TryWrite(speechBuffer.ToArray());
+                            WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
                         }
                         speechBuffer.Clear();
+                    }
+                    else if (tooLong)
+                    {
+                        // 15秒の強制分割。無音を検出したわけではなく、発話はまだ続いている可能性が高いため
+                        // inSpeechはtrueのまま維持し、直前の音声の末尾を少しだけ次のセグメントへ引き継ぐ。
+                        // これにより、分割位置をまたぐ文でWhisperが直前の文脈(語尾)を完全に失うのを防ぐ
+                        WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
+
+                        int overlapSamples = Math.Min(ForcedSplitOverlapChunks * ChunkSamples, speechBuffer.Count);
+                        var carryOver = speechBuffer.GetRange(speechBuffer.Count - overlapSamples, overlapSamples);
+                        speechBuffer.Clear();
+                        speechBuffer.AddRange(carryOver);
+                        silenceChunkCount = 0;
                     }
                 }
 
@@ -287,7 +317,7 @@ public class AudioPipeline
             // ここで送らないと、話している最中に停止した最後の発話が丸ごと消える。
             if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
             {
-                segmentChannel.Writer.TryWrite(speechBuffer.ToArray());
+                WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
             }
 
             // キューへの書き込みを締め切る。
@@ -384,11 +414,41 @@ public class AudioPipeline
         }
     }
 
+    /// <summary>
+    /// マイク/オーディオデバイス固有の直流成分(DCオフセット)を取り除いてからRMSを計算する。
+    /// DCオフセットが乗っていると、無音のはずの区間でもRMSが下がりきらず、VADが
+    /// 「ずっと発話中」と誤判定し続けることがあるため、平均値を差し引いてから実効値を求める。
+    /// (VAD判定にのみ使用し、Whisperに渡す音声データ自体は元のサンプルのまま加工しない)
+    /// </summary>
     private static float ComputeRms(float[] buffer, int count)
     {
+        double sum = 0;
+        for (int i = 0; i < count; i++) sum += buffer[i];
+        double mean = sum / count;
+
         double sumSquares = 0;
-        for (int i = 0; i < count; i++) sumSquares += buffer[i] * buffer[i];
+        for (int i = 0; i < count; i++)
+        {
+            double centered = buffer[i] - mean;
+            sumSquares += centered * centered;
+        }
         return (float)Math.Sqrt(sumSquares / count);
+    }
+
+    /// <summary>
+    /// 音声セグメントをキューへ書き込む。DropOldestモードのチャンネルはキューが満杯の場合
+    /// 常に書き込みに成功する(内部で一番古い要素を破棄する)ため、TryWriteの戻り値だけでは
+    /// 破棄が起きたかどうか分からない。ここでは書き込み前のキュー件数を見て破棄の発生を検知し、
+    /// 累計件数をSegmentsDroppedイベントで通知する。
+    /// </summary>
+    private void WriteSegment(ChannelWriter<float[]> writer, ChannelReader<float[]> reader, float[] segment)
+    {
+        if (reader.Count >= SegmentChannelCapacity)
+        {
+            _droppedSegmentCount++;
+            SegmentsDropped?.Invoke(_droppedSegmentCount);
+        }
+        writer.TryWrite(segment);
     }
 
     private async Task TranscribeSegmentAsync(float[] samples, ChannelWriter<string> transcriptWriter)
@@ -424,7 +484,12 @@ public class AudioPipeline
             bool isDuplicate;
             lock (_dedupLock)
             {
-                isDuplicate = text == _lastGlobalText && (DateTime.Now - _lastGlobalTime) < TimeSpan.FromSeconds(10);
+                // 完全一致+10秒という従来の重複除去は、Whisperがセグメント境界付近で
+                // 同じ文をほぼ即座に2回出力するケース(プリロールの重なり等)を狙ったものだが、
+                // 窓が長すぎると「Yes.」のような短い発話が数秒後に本当にもう一度発言された
+                // 場合まで誤って握りつぶしてしまう。ここでは狙い通りの直近重複だけを
+                // 除去できるよう、窓を3秒に短縮する
+                isDuplicate = text == _lastGlobalText && (DateTime.Now - _lastGlobalTime) < TimeSpan.FromSeconds(3);
                 if (!isDuplicate)
                 {
                     _lastGlobalText = text;

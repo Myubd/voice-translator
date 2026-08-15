@@ -76,9 +76,16 @@
                             <TextBlock Text="オーバーレイ表示"/>
                         </StackPanel>
                     </Button>
+                    <Button x:Name="ExportButton" Style="{StaticResource IconButton}" Width="130" Margin="8,0,0,0" Click="ExportButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE74E;" Margin="0,0,6,0"/>
+                            <TextBlock Text="履歴を保存"/>
+                        </StackPanel>
+                    </Button>
                 </StackPanel>
 
                 <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="DropCountText" Text="" VerticalAlignment="Center" Foreground="#ffaa66" Margin="0,0,12,0"/>
                     <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#666677" Margin="0,0,6,0"/>
                     <TextBlock x:Name="StatusText" Text="停止中" VerticalAlignment="Center" Foreground="#aaaaba"/>
                 </StackPanel>
