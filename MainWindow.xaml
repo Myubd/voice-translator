@@ -61,7 +61,7 @@
                     <Button x:Name="SettingsButton" Style="{StaticResource IconButton}" Width="110" Margin="8,0,0,0" Click="SettingsButton_Click">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE713;" Margin="0,0,6,0"/>
-                            <TextBlock Text="音声設定"/>
+                            <TextBlock Text="設定"/>
                         </StackPanel>
                     </Button>
                     <Button x:Name="ClearButton" Style="{StaticResource IconButton}" Width="110" Margin="8,0,0,0" Click="ClearButton_Click">

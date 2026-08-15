@@ -132,224 +132,238 @@ public class AudioPipeline
         var processor = processorBuilder.Build();
         _processor = processor;
 
-        using var capture = new WasapiLoopbackCapture(target);
-        var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
-        {
-            BufferLength = capture.WaveFormat.AverageBytesPerSecond * 5,
-            DiscardOnBufferOverflow = true
-        };
-
-        ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
-        if (capture.WaveFormat.Channels == 2)
-        {
-            sampleProvider = new StereoToMonoSampleProvider(sampleProvider)
-            {
-                LeftVolume = 0.5f,
-                RightVolume = 0.5f
-            };
-        }
-        var resampler = new WdlResamplingSampleProvider(sampleProvider, SampleRate);
-
-        capture.DataAvailable += (s, e) =>
-        {
-            bufferedProvider.AddSamples(e.Buffer, 0, e.BytesRecorded);
-        };
-
-        // デバイスが他プロセス(Sonar等)と一時的に競合してエラーになることがあるため、
-        // 数回リトライしてから諦める(Sonarを手動再起動しなくても自然に復帰することが多い)
-        const int maxRetries = 5;
-        bool captureStarted = false;
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
-        {
-            try
-            {
-                capture.StartRecording();
-                captureStarted = true;
-                break;
-            }
-            catch (System.Runtime.InteropServices.COMException) when (attempt < maxRetries)
-            {
-                StatusChanged?.Invoke($"デバイスが使用中のためリトライ中... ({attempt}/{maxRetries})");
-                await Task.Delay(1000, cancellationToken);
-            }
-        }
-
-        // 最終試行まで失敗した場合、ここで明示的に打ち切る。
-        // これを入れないと、録音が始まっていないまま後続のVADループへ進んでしまう
-        // (無音がずっと続くだけに見え、原因が分かりにくくなる)
-        if (!captureStarted)
-        {
-            StatusChanged?.Invoke("音声キャプチャを開始できませんでした。デバイスが他アプリで使用中の可能性があります。");
-            await processor.DisposeAsync();
-            _processor = null;
-            return;
-        }
-
-        // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく
-        if (_translationService != null)
-        {
-            StatusChanged?.Invoke("翻訳の準備中(用語集を抽出しています)...");
-            await _translationService.PrepareAsync();
-        }
-
-        StatusChanged?.Invoke($"認識中: {target.FriendlyName}");
-
-        // Whisper処理を1本のキューで順番に処理するためのチャンネル。
-        // これにより、発話が連続しても複数のWhisper推論が同時実行されてリソースを
-        // 奪い合うことがなくなる(翻訳は引き続き並行実行して問題ない)。
-        // 発話が連続すると処理待ちが溜まっていくため、キューに上限を設ける。
-        // 上限を超えたら「一番古い(=もう鮮度が落ちている)」セグメントを捨てて、
-        // 遅延がどこまでも蓄積し続けるのを防ぐ
-        var segmentChannel = Channel.CreateBounded<float[]>(new BoundedChannelOptions(SegmentChannelCapacity)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
-        _droppedSegmentCount = 0;
-
-        // Whisperの文字起こし結果を翻訳ワーカーへ渡すための第2キュー。
-        // これによりWhisper自体は翻訳の完了を待たずに次のセグメントへ進める
-        // (翻訳が遅い/詰まっても、音声認識側の処理は止まらない)。
-        // 文字列のみを保持する軽量なキューなので上限は設けず、Whisper側のDropOldestで
-        // 全体の遅延蓄積を防ぐ設計に任せる。
-        var transcriptChannel = Channel.CreateUnbounded<string>();
-
-        var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer);
-        var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader);
-
-        var readBuffer = new float[ChunkSamples];
-        var speechBuffer = new List<float>();
-        var prerollBuffer = new Queue<float[]>();
-        int silenceChunkCount = 0;
-        bool inSpeech = false;
-
+        // processorBuild()後、この中で例外が発生した場合にWhisperProcessorが破棄されないまま
+        // 残ってしまうのを防ぐため、以降の処理全体を try/catch で囲む
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            using var capture = new WasapiLoopbackCapture(target);
+            var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
             {
-                while (bufferedProvider.BufferedDuration.TotalMilliseconds < 40)
+                BufferLength = capture.WaveFormat.AverageBytesPerSecond * 5,
+                DiscardOnBufferOverflow = true
+            };
+
+            ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
+            if (capture.WaveFormat.Channels == 2)
+            {
+                sampleProvider = new StereoToMonoSampleProvider(sampleProvider)
                 {
-                    await Task.Delay(5, cancellationToken);
+                    LeftVolume = 0.5f,
+                    RightVolume = 0.5f
+                };
+            }
+            var resampler = new WdlResamplingSampleProvider(sampleProvider, SampleRate);
+
+            capture.DataAvailable += (s, e) =>
+            {
+                bufferedProvider.AddSamples(e.Buffer, 0, e.BytesRecorded);
+            };
+
+            // デバイスが他プロセス(Sonar等)と一時的に競合してエラーになることがあるため、
+            // 数回リトライしてから諦める(Sonarを手動再起動しなくても自然に復帰することが多い)
+            const int maxRetries = 5;
+            bool captureStarted = false;
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    capture.StartRecording();
+                    captureStarted = true;
+                    break;
                 }
-
-                int read = resampler.Read(readBuffer, 0, ChunkSamples);
-                if (read == 0)
+                catch (System.Runtime.InteropServices.COMException) when (attempt < maxRetries)
                 {
-                    await Task.Delay(10, cancellationToken);
-                    continue;
+                    StatusChanged?.Invoke($"デバイスが使用中のためリトライ中... ({attempt}/{maxRetries})");
+                    await Task.Delay(1000, cancellationToken);
                 }
+            }
 
-                float rms = ComputeRms(readBuffer, read);
+            // 最終試行まで失敗した場合、ここで明示的に打ち切る。
+            // これを入れないと、録音が始まっていないまま後続のVADループへ進んでしまう
+            // (無音がずっと続くだけに見え、原因が分かりにくくなる)
+            if (!captureStarted)
+            {
+                StatusChanged?.Invoke("音声キャプチャを開始できませんでした。デバイスが他アプリで使用中の可能性があります。");
+                await processor.DisposeAsync();
+                _processor = null;
+                return;
+            }
 
-                // ヒステリシス: 発話中でない時は開始閾値(EnergyThreshold)、
-                // 発話中は継続閾値(EnergyThreshold×HysteresisRatio、より低い)で判定する。
-                // 同じ閾値を使い回すと、閾値ギリギリの音量が続く区間(息継ぎ等)で
-                // isSpeechChunkがtrue/falseを細かく往復し、無音カウントが0にリセットされたり
-                // 逆に短時間で無音判定が成立してセグメントが分断されたりしやすい。
-                float activeThreshold = inSpeech ? EnergyThreshold * HysteresisRatio : EnergyThreshold;
-                bool isSpeechChunk = rms > activeThreshold;
+            // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく
+            if (_translationService != null)
+            {
+                StatusChanged?.Invoke("翻訳の準備中(用語集を抽出しています)...");
+                await _translationService.PrepareAsync();
+            }
 
-                if (isSpeechChunk)
+            StatusChanged?.Invoke($"認識中: {target.FriendlyName}");
+
+            // Whisper処理を1本のキューで順番に処理するためのチャンネル。
+            // これにより、発話が連続しても複数のWhisper推論が同時実行されてリソースを
+            // 奪い合うことがなくなる(翻訳は引き続き並行実行して問題ない)。
+            // 発話が連続すると処理待ちが溜まっていくため、キューに上限を設ける。
+            // 上限を超えたら「一番古い(=もう鮮度が落ちている)」セグメントを捨てて、
+            // 遅延がどこまでも蓄積し続けるのを防ぐ
+            var segmentChannel = Channel.CreateBounded<float[]>(new BoundedChannelOptions(SegmentChannelCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+            _droppedSegmentCount = 0;
+
+            // Whisperの文字起こし結果を翻訳ワーカーへ渡すための第2キュー。
+            // これによりWhisper自体は翻訳の完了を待たずに次のセグメントへ進める
+            // (翻訳が遅い/詰まっても、音声認識側の処理は止まらない)。
+            // 文字列のみを保持する軽量なキューなので上限は設けず、Whisper側のDropOldestで
+            // 全体の遅延蓄積を防ぐ設計に任せる。
+            var transcriptChannel = Channel.CreateUnbounded<string>();
+
+            var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer);
+            var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader);
+
+            var readBuffer = new float[ChunkSamples];
+            var speechBuffer = new List<float>();
+            var prerollBuffer = new Queue<float[]>();
+            int silenceChunkCount = 0;
+            bool inSpeech = false;
+
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    if (!inSpeech)
+                    while (bufferedProvider.BufferedDuration.TotalMilliseconds < 40)
                     {
-                        inSpeech = true;
-                        speechBuffer.Clear();
-                        // 発話開始の瞬間、直前まで無音だと思って捨てていた分(プリロール)を
-                        // 先頭に付与することで、語頭の欠落を防ぐ
-                        foreach (var chunk in prerollBuffer)
-                        {
-                            speechBuffer.AddRange(chunk);
-                        }
+                        await Task.Delay(5, cancellationToken);
                     }
-                    speechBuffer.AddRange(readBuffer.Take(read));
-                    silenceChunkCount = 0;
-                }
-                else if (inSpeech)
-                {
-                    speechBuffer.AddRange(readBuffer.Take(read));
-                    silenceChunkCount++;
 
-                    bool silenceLongEnough = silenceChunkCount >= SilenceChunksToEndSpeech;
-                    bool tooLong = speechBuffer.Count / ChunkSamples >= MaxSpeechChunks;
-
-                    if (silenceLongEnough)
+                    int read = resampler.Read(readBuffer, 0, ChunkSamples);
+                    if (read == 0)
                     {
-                        // 無音による自然な発話終了。プリロールと同様、この後は非発話状態に戻る
-                        inSpeech = false;
-                        if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
-                        {
-                            WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
-                        }
-                        speechBuffer.Clear();
+                        await Task.Delay(10, cancellationToken);
+                        continue;
                     }
-                    else if (tooLong)
-                    {
-                        // 15秒の強制分割。無音を検出したわけではなく、発話はまだ続いている可能性が高いため
-                        // inSpeechはtrueのまま維持し、直前の音声の末尾を少しだけ次のセグメントへ引き継ぐ。
-                        // これにより、分割位置をまたぐ文でWhisperが直前の文脈(語尾)を完全に失うのを防ぐ
-                        WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
 
-                        int overlapSamples = Math.Min(ForcedSplitOverlapChunks * ChunkSamples, speechBuffer.Count);
-                        var carryOver = speechBuffer.GetRange(speechBuffer.Count - overlapSamples, overlapSamples);
-                        speechBuffer.Clear();
-                        speechBuffer.AddRange(carryOver);
+                    float rms = ComputeRms(readBuffer, read);
+
+                    // ヒステリシス: 発話中でない時は開始閾値(EnergyThreshold)、
+                    // 発話中は継続閾値(EnergyThreshold×HysteresisRatio、より低い)で判定する。
+                    // 同じ閾値を使い回すと、閾値ギリギリの音量が続く区間(息継ぎ等)で
+                    // isSpeechChunkがtrue/falseを細かく往復し、無音カウントが0にリセットされたり
+                    // 逆に短時間で無音判定が成立してセグメントが分断されたりしやすい。
+                    float activeThreshold = inSpeech ? EnergyThreshold * HysteresisRatio : EnergyThreshold;
+                    bool isSpeechChunk = rms > activeThreshold;
+
+                    if (isSpeechChunk)
+                    {
+                        if (!inSpeech)
+                        {
+                            inSpeech = true;
+                            speechBuffer.Clear();
+                            // 発話開始の瞬間、直前まで無音だと思って捨てていた分(プリロール)を
+                            // 先頭に付与することで、語頭の欠落を防ぐ
+                            foreach (var chunk in prerollBuffer)
+                            {
+                                speechBuffer.AddRange(chunk);
+                            }
+                        }
+                        speechBuffer.AddRange(readBuffer.Take(read));
                         silenceChunkCount = 0;
                     }
-                }
-
-                // 発話中でない間も、直近のチャンクを常にプリロール用バッファに保持しておく
-                if (!inSpeech)
-                {
-                    prerollBuffer.Enqueue(readBuffer.Take(read).ToArray());
-                    while (prerollBuffer.Count > PrerollChunks)
+                    else if (inSpeech)
                     {
-                        prerollBuffer.Dequeue();
+                        speechBuffer.AddRange(readBuffer.Take(read));
+                        silenceChunkCount++;
+
+                        bool silenceLongEnough = silenceChunkCount >= SilenceChunksToEndSpeech;
+                        bool tooLong = speechBuffer.Count / ChunkSamples >= MaxSpeechChunks;
+
+                        if (silenceLongEnough)
+                        {
+                            // 無音による自然な発話終了。プリロールと同様、この後は非発話状態に戻る
+                            inSpeech = false;
+                            if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
+                            {
+                                WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
+                            }
+                            speechBuffer.Clear();
+                        }
+                        else if (tooLong)
+                        {
+                            // 15秒の強制分割。無音を検出したわけではなく、発話はまだ続いている可能性が高いため
+                            // inSpeechはtrueのまま維持し、直前の音声の末尾を少しだけ次のセグメントへ引き継ぐ。
+                            // これにより、分割位置をまたぐ文でWhisperが直前の文脈(語尾)を完全に失うのを防ぐ
+                            WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
+
+                            int overlapSamples = Math.Min(ForcedSplitOverlapChunks * ChunkSamples, speechBuffer.Count);
+                            var carryOver = speechBuffer.GetRange(speechBuffer.Count - overlapSamples, overlapSamples);
+                            speechBuffer.Clear();
+                            speechBuffer.AddRange(carryOver);
+                            silenceChunkCount = 0;
+                        }
+                    }
+
+                    // 発話中でない間も、直近のチャンクを常にプリロール用バッファに保持しておく
+                    if (!inSpeech)
+                    {
+                        prerollBuffer.Enqueue(readBuffer.Take(read).ToArray());
+                        while (prerollBuffer.Count > PrerollChunks)
+                        {
+                            prerollBuffer.Dequeue();
+                        }
                     }
                 }
             }
+            finally
+            {
+                capture.StopRecording();
+
+                // 停止した瞬間、まだ発話の途中(無音判定が確定する前)だった分がspeechBufferに
+                // 残っている可能性がある。短すぎなければ、これも最後の1区間として送っておく。
+                // ここで送らないと、話している最中に停止した最後の発話が丸ごと消える。
+                if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
+                {
+                    WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
+                }
+
+                // キューへの書き込みを締め切る。
+                // RunWhisperWorkerAsyncはCancellationToken.Noneで読んでいるため、ここでCompleteすれば
+                // 既にキューに積まれている(まだ処理していない)分もキャンセルされずに最後まで処理される。
+                segmentChannel.Writer.Complete();
+                try
+                {
+                    await whisperWorkerTask;
+                }
+                catch (Exception ex)
+                {
+                    // ワーカー内の個別例外は既にRunWhisperWorkerAsync側でログ済みだが、
+                    // ここに来る場合はワーカー自体の異常終了なので念のため記録する
+                    Logger.Log("AudioPipeline.Whisper", "Whisperワーカーの終了待機中に例外が発生しました。", ex);
+                }
+
+                // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ
+                transcriptChannel.Writer.Complete();
+                try
+                {
+                    await translationWorkerTask;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log("AudioPipeline.Translation", "翻訳ワーカーの終了待機中に例外が発生しました。", ex);
+                }
+
+                await processor.DisposeAsync();
+                _processor = null;
+
+                StatusChanged?.Invoke("停止しました");
+            }
         }
-        finally
+        catch
         {
-            capture.StopRecording();
-
-            // 停止した瞬間、まだ発話の途中(無音判定が確定する前)だった分がspeechBufferに
-            // 残っている可能性がある。短すぎなければ、これも最後の1区間として送っておく。
-            // ここで送らないと、話している最中に停止した最後の発話が丸ごと消える。
-            if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
+            if (_processor != null)
             {
-                WriteSegment(segmentChannel.Writer, segmentChannel.Reader, speechBuffer.ToArray());
+                await _processor.DisposeAsync();
+                _processor = null;
             }
-
-            // キューへの書き込みを締め切る。
-            // RunWhisperWorkerAsyncはCancellationToken.Noneで読んでいるため、ここでCompleteすれば
-            // 既にキューに積まれている(まだ処理していない)分もキャンセルされずに最後まで処理される。
-            segmentChannel.Writer.Complete();
-            try
-            {
-                await whisperWorkerTask;
-            }
-            catch (Exception ex)
-            {
-                // ワーカー内の個別例外は既にRunWhisperWorkerAsync側でログ済みだが、
-                // ここに来る場合はワーカー自体の異常終了なので念のため記録する
-                Logger.Log("AudioPipeline.Whisper", "Whisperワーカーの終了待機中に例外が発生しました。", ex);
-            }
-
-            // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ
-            transcriptChannel.Writer.Complete();
-            try
-            {
-                await translationWorkerTask;
-            }
-            catch (Exception ex)
-            {
-                Logger.Log("AudioPipeline.Translation", "翻訳ワーカーの終了待機中に例外が発生しました。", ex);
-            }
-
-            await processor.DisposeAsync();
-            _processor = null;
-
-            StatusChanged?.Invoke("停止しました");
+            throw;
         }
     }
 

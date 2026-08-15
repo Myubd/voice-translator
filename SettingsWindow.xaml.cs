@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Navigation;
 
 namespace LoopbackRecorder;
 
@@ -24,6 +27,14 @@ public partial class SettingsWindow : Window
 
     // DeepL APIキーはPasswordBox/TextBoxを表示切り替えで共有するため、値そのものはここで一元管理する
     private string _deepLApiKey = "";
+
+    // ==== ショートカットキーの記録用状態 ====
+    // "startstop" / "overlay" / null(記録中でない)
+    private string? _recordingHotkeyTarget;
+    private ModifierKeys _startStopModifiers;
+    private Key _startStopKey;
+    private ModifierKeys _overlayModifiers;
+    private Key _overlayKey;
 
     public SettingsWindow(AppSettings currentSettings)
     {
@@ -80,6 +91,12 @@ public partial class SettingsWindow : Window
         OverlayMaxLinesSlider.Value = Settings.OverlayMaxLines;
         WhisperPromptTextBox.Text = Settings.WhisperPrompt;
         OllamaContextTextBox.Text = Settings.OllamaContext;
+
+        // ショートカットキーの現在値を読み込み、表示に反映
+        (_startStopModifiers, _startStopKey) = Settings.GetStartStopHotkey();
+        (_overlayModifiers, _overlayKey) = Settings.GetOverlayHotkey();
+        UpdateHotkeyDisplays();
+        PreviewKeyDown += SettingsWindow_PreviewKeyDown;
 
         // バックエンド選択を復元
         foreach (ComboBoxItem item in BackendComboBox.Items)
@@ -199,29 +216,132 @@ public partial class SettingsWindow : Window
     private void UpdateBackendPanelsVisibility()
     {
         // XAMLロード中(まだ子要素が無い)は何もしない
-        if (DeepLPanel == null || OllamaPanel == null) return;
+        if (DeepLPanel == null || OllamaPanel == null || OllamaContextPanel == null) return;
 
         bool isOllama = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string == "ollama";
         DeepLPanel.Visibility = isOllama ? Visibility.Collapsed : Visibility.Visible;
         OllamaPanel.Visibility = isOllama ? Visibility.Visible : Visibility.Collapsed;
+        // 参考コンテキストは「言語」タブ側にあるが、Ollama使用時のみ意味を持つため
+        // バックエンド選択(エンジンタブ)と連動して表示/非表示を切り替える
+        OllamaContextPanel.Visibility = isOllama ? Visibility.Visible : Visibility.Collapsed;
     }
 
     /// <summary>左サイドバーの選択に応じて、右側の表示ページを切り替える</summary>
     private void Nav_Checked(object sender, RoutedEventArgs e)
     {
         // XAMLロード中(まだ各ページの要素が無い)は何もしない
-        if (AudioPage == null || RecognitionPage == null || TranslationPage == null
-            || OverlayPage == null || AboutPage == null) return;
+        if (AudioPage == null || EnginePage == null || LanguagePage == null
+            || OverlayPage == null || ShortcutPage == null || AboutPage == null) return;
 
         AudioPage.Visibility = NavAudio.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
-        RecognitionPage.Visibility = NavRecognition.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
-        TranslationPage.Visibility = NavTranslation.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        EnginePage.Visibility = NavEngine.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        LanguagePage.Visibility = NavLanguage.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         OverlayPage.Visibility = NavOverlay.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        ShortcutPage.Visibility = NavShortcuts.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         AboutPage.Visibility = NavAbout.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ==== ショートカットキーの記録 ====
+
+    private static string FormatHotkey(ModifierKeys modifiers, Key key)
+    {
+        var parts = new List<string>();
+        if (modifiers.HasFlag(ModifierKeys.Control)) parts.Add("Ctrl");
+        if (modifiers.HasFlag(ModifierKeys.Alt)) parts.Add("Alt");
+        if (modifiers.HasFlag(ModifierKeys.Shift)) parts.Add("Shift");
+        if (modifiers.HasFlag(ModifierKeys.Windows)) parts.Add("Win");
+        parts.Add(key.ToString());
+        return string.Join(" + ", parts);
+    }
+
+    private void UpdateHotkeyDisplays()
+    {
+        StartStopHotkeyText.Text = FormatHotkey(_startStopModifiers, _startStopKey);
+        OverlayHotkeyText.Text = FormatHotkey(_overlayModifiers, _overlayKey);
+    }
+
+    private void StartStopHotkeyChangeButton_Click(object sender, RoutedEventArgs e)
+    {
+        BeginRecordingHotkey("startstop");
+    }
+
+    private void OverlayHotkeyChangeButton_Click(object sender, RoutedEventArgs e)
+    {
+        BeginRecordingHotkey("overlay");
+    }
+
+    private void BeginRecordingHotkey(string target)
+    {
+        _recordingHotkeyTarget = target;
+        StatusText.Text = "";
+        var placeholder = "キーを入力してください(Escで取消)...";
+        if (target == "startstop") StartStopHotkeyText.Text = placeholder;
+        else OverlayHotkeyText.Text = placeholder;
+    }
+
+    /// <summary>ショートカットキー記録中、ウィンドウ全体でキー入力を捕捉する。
+    /// フォーカスがどのコントロールにあってもPreview(トンネリング)イベントなので確実に拾える。</summary>
+    private void SettingsWindow_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_recordingHotkeyTarget == null) return;
+
+        e.Handled = true;
+
+        // Alt絡みの組み合わせはKey.Systemとして通知され、実際のキーはSystemKeyに入る
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+
+        // 修飾キー単体の押下はまだ入力途中なので、次のキー入力を待つ
+        if (key is Key.LeftCtrl or Key.RightCtrl or Key.LeftAlt or Key.RightAlt
+                or Key.LeftShift or Key.RightShift or Key.LWin or Key.RWin or Key.System)
+        {
+            return;
+        }
+
+        if (key == Key.Escape)
+        {
+            _recordingHotkeyTarget = null;
+            UpdateHotkeyDisplays();
+            return;
+        }
+
+        var modifiers = Keyboard.Modifiers;
+        if (modifiers == ModifierKeys.None)
+        {
+            StatusText.Text = "修飾キー(Ctrl・Alt・Shift・Winのいずれか)を1つ以上組み合わせてください。";
+            _recordingHotkeyTarget = null;
+            UpdateHotkeyDisplays();
+            return;
+        }
+
+        if (_recordingHotkeyTarget == "startstop")
+        {
+            _startStopModifiers = modifiers;
+            _startStopKey = key;
+        }
+        else
+        {
+            _overlayModifiers = modifiers;
+            _overlayKey = key;
+        }
+
+        _recordingHotkeyTarget = null;
+        UpdateHotkeyDisplays();
     }
 
     private void SaveButton_Click(object sender, RoutedEventArgs e)
     {
+        // 記録中に保存を押した場合は一旦キャンセル扱いにする
+        _recordingHotkeyTarget = null;
+
+        // 「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じ組み合わせが割り当てられていると
+        // 常に両方が反応してしまい紛らわしいため、保存前に検証する
+        if (_startStopModifiers == _overlayModifiers && _startStopKey == _overlayKey)
+        {
+            StatusText.Text = "「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じショートカットキーは設定できません。";
+            UpdateHotkeyDisplays();
+            return;
+        }
+
         if (DeviceComboBox.SelectedItem is AudioDeviceInfo selectedDevice)
         {
             Settings.DeviceId = selectedDevice.Id;
@@ -243,6 +363,10 @@ public partial class SettingsWindow : Window
         Settings.RecognitionLanguage = (RecognitionLanguageComboBox.SelectedItem as LanguageOption)?.WhisperCode ?? "auto";
         Settings.TargetLanguageCode = (TargetLanguageComboBox.SelectedItem as LanguageOption)?.DeepLCode ?? "JA";
         Settings.OllamaContext = OllamaContextTextBox.Text;
+        Settings.StartStopHotkeyModifiers = _startStopModifiers.ToString();
+        Settings.StartStopHotkeyKey = _startStopKey.ToString();
+        Settings.OverlayHotkeyModifiers = _overlayModifiers.ToString();
+        Settings.OverlayHotkeyKey = _overlayKey.ToString();
 
         Settings.SaveToEnv();
 
@@ -254,5 +378,22 @@ public partial class SettingsWindow : Window
     {
         DialogResult = false;
         Close();
+    }
+
+    /// <summary>「このアプリについて」内のリポジトリリンクを、既定のブラウザで開く。
+    /// UseShellExecute=trueが必要(.NET Core以降はProcess.Startの既定がfalseになり、
+    /// 指定しないとURLを直接起動できずWin32Exceptionになる)。</summary>
+    private void RepositoryLink_RequestNavigate(object sender, RequestNavigateEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("SettingsWindow", "リポジトリリンクを開けませんでした。", ex);
+            StatusText.Text = "リンクを開けませんでした。ブラウザで手動で開いてください。";
+        }
+        e.Handled = true;
     }
 }

@@ -82,22 +82,50 @@ public partial class MainWindow : Window
 
     /// <summary>ゲームプレイ中はAlt-Tabせずに操作したいという要望に応え、
     /// アプリが非アクティブでも効くグローバルホットキーを登録する。
-    /// Ctrl+Alt+R: 翻訳の開始/停止、Ctrl+Alt+O: オーバーレイの表示切り替え</summary>
+    /// キーの組み合わせは設定画面の「ショートカット」タブから変更できる(既定はCtrl+Alt+R / Ctrl+Alt+O)。
+    /// 設定変更後の再登録にも対応できるよう、呼び出すたびに一度dispose→再作成する。</summary>
     private void RegisterHotkeys()
     {
+        _hotkeyManager?.Dispose();
+        _hotkeyManager = new HotkeyManager(this);
+
+        // 2つのホットキーは別々にtry/catchする。
+        // 以前は1つのtryにまとめていたため、片方(例: 開始/停止)が他アプリと重複していると
+        // 例外でそこから先に進めず、重複していないもう片方(オーバーレイ)まで巻き添えで
+        // 登録されない不具合があった。
+        bool startStopFailed = false;
+        bool overlayFailed = false;
+
         try
         {
-            _hotkeyManager = new HotkeyManager(this);
-            _hotkeyManager.Register(HotkeyManager.Modifiers.Control | HotkeyManager.Modifiers.Alt, System.Windows.Input.Key.R,
-                () => StartStopButton_Click(this, new RoutedEventArgs()));
-            _hotkeyManager.Register(HotkeyManager.Modifiers.Control | HotkeyManager.Modifiers.Alt, System.Windows.Input.Key.O,
-                () => OverlayButton_Click(this, new RoutedEventArgs()));
+            var (modifiers, key) = _settings.GetStartStopHotkey();
+            _hotkeyManager.Register(modifiers, key, () => StartStopButton_Click(this, new RoutedEventArgs()));
         }
         catch (Exception ex)
         {
-            // 他アプリと同じ組み合わせが既に登録済み等で失敗しても、通常のボタン操作は引き続き使えるため
-            // アプリ自体は継続する。原因調査ができるよう記録だけ残す
-            Logger.Log("MainWindow.Hotkey", "グローバルホットキーの登録に失敗しました。", ex);
+            Logger.Log("MainWindow.Hotkey", "「翻訳開始/停止」のショートカットキー登録に失敗しました。", ex);
+            startStopFailed = true;
+        }
+
+        try
+        {
+            var (modifiers, key) = _settings.GetOverlayHotkey();
+            _hotkeyManager.Register(modifiers, key, () => OverlayButton_Click(this, new RoutedEventArgs()));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("MainWindow.Hotkey", "「オーバーレイ表示切り替え」のショートカットキー登録に失敗しました。", ex);
+            overlayFailed = true;
+        }
+
+        // 他アプリと同じ組み合わせが既に登録済み等で失敗しても、通常のボタン操作は引き続き使えるため
+        // アプリ自体は継続するが、原因不明のまま「ホットキーが効かない」状態にならないよう通知する
+        if (startStopFailed || overlayFailed)
+        {
+            string which = startStopFailed && overlayFailed
+                ? "「翻訳開始/停止」「オーバーレイ表示切り替え」両方のショートカットキー"
+                : startStopFailed ? "「翻訳開始/停止」のショートカットキー" : "「オーバーレイ表示切り替え」のショートカットキー";
+            StatusText.Text = $"{which}の登録に失敗しました(他アプリと重複している可能性があります)。設定画面で変更できます。";
         }
     }
 
@@ -181,6 +209,8 @@ public partial class MainWindow : Window
         {
             _settings = settingsWindow.Settings;
             _overlayWindow?.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines);
+            // ショートカットキーが変更されている可能性があるため、登録し直す
+            RegisterHotkeys();
         }
     }
 

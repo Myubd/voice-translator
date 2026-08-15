@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Windows.Input;
 
 /// <summary>
 /// アプリの設定値をまとめて保持するクラス。
@@ -50,6 +51,29 @@ public class AppSettings
 
     /// <summary>Ollama使用時、翻訳の背景知識として渡す参考コンテキスト(記事の抜粋など)</summary>
     public string OllamaContext { get; set; } = "";
+
+    // ==== グローバルショートカットキー ====
+    // ModifierKeys/Keyの各Enum名(例: "Control, Alt" / "R")をそのまま文字列として保存する。
+    // Enum.TryParseがFlags列挙体のカンマ区切り表記をそのまま解釈できるため、独自のパース処理が不要になる。
+    public string StartStopHotkeyModifiers { get; set; } = "Control, Alt";
+    public string StartStopHotkeyKey { get; set; } = "R";
+    public string OverlayHotkeyModifiers { get; set; } = "Control, Alt";
+    public string OverlayHotkeyKey { get; set; } = "O";
+
+    /// <summary>「翻訳開始/停止」に割り当てられたショートカットキーを取得する。値が不正な場合は既定値(Ctrl+Alt+R)を返す</summary>
+    public (ModifierKeys Modifiers, Key Key) GetStartStopHotkey() =>
+        ParseHotkey(StartStopHotkeyModifiers, StartStopHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.R);
+
+    /// <summary>「オーバーレイ表示切り替え」に割り当てられたショートカットキーを取得する。値が不正な場合は既定値(Ctrl+Alt+O)を返す</summary>
+    public (ModifierKeys Modifiers, Key Key) GetOverlayHotkey() =>
+        ParseHotkey(OverlayHotkeyModifiers, OverlayHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.O);
+
+    private static (ModifierKeys, Key) ParseHotkey(string modifiersStr, string keyStr, ModifierKeys defaultModifiers, Key defaultKey)
+    {
+        var modifiers = Enum.TryParse<ModifierKeys>(modifiersStr, ignoreCase: true, out var parsedModifiers) ? parsedModifiers : defaultModifiers;
+        var key = Enum.TryParse<Key>(keyStr, ignoreCase: true, out var parsedKey) ? parsedKey : defaultKey;
+        return (modifiers, key);
+    }
 
     private const string EnvPath = ".env";
 
@@ -111,6 +135,11 @@ public class AppSettings
         // 改行のエスケープ(\n → 改行)はEnvLoader側で共通処理済み
         settings.OllamaContext = Environment.GetEnvironmentVariable("OLLAMA_CONTEXT") ?? "";
         settings.OllamaEndpoint = NormalizeEndpoint(settings.OllamaEndpoint);
+
+        settings.StartStopHotkeyModifiers = Environment.GetEnvironmentVariable("START_STOP_HOTKEY_MODIFIERS") ?? "Control, Alt";
+        settings.StartStopHotkeyKey = Environment.GetEnvironmentVariable("START_STOP_HOTKEY_KEY") ?? "R";
+        settings.OverlayHotkeyModifiers = Environment.GetEnvironmentVariable("OVERLAY_HOTKEY_MODIFIERS") ?? "Control, Alt";
+        settings.OverlayHotkeyKey = Environment.GetEnvironmentVariable("OVERLAY_HOTKEY_KEY") ?? "O";
 
         return settings;
     }
@@ -200,6 +229,12 @@ public class AppSettings
             "",
             "# Ollama使用時、翻訳の背景知識として渡す参考コンテキスト(改行は\\nでエスケープ済み)",
             $"OLLAMA_CONTEXT={escapedContext}",
+            "",
+            "# グローバルショートカットキー(設定画面の「ショートカット」タブから変更可能)",
+            $"START_STOP_HOTKEY_MODIFIERS={StartStopHotkeyModifiers}",
+            $"START_STOP_HOTKEY_KEY={StartStopHotkeyKey}",
+            $"OVERLAY_HOTKEY_MODIFIERS={OverlayHotkeyModifiers}",
+            $"OVERLAY_HOTKEY_KEY={OverlayHotkeyKey}",
         };
 
         // APIキーを含む設定ファイルなので、書き込み途中のクラッシュ/電源断で内容が
@@ -227,6 +262,10 @@ public class AppSettings
         Environment.SetEnvironmentVariable("OLLAMA_MODEL", OllamaModel);
         Environment.SetEnvironmentVariable("OLLAMA_ENDPOINT", OllamaEndpoint);
         Environment.SetEnvironmentVariable("OLLAMA_CONTEXT", escapedContext);
+        Environment.SetEnvironmentVariable("START_STOP_HOTKEY_MODIFIERS", StartStopHotkeyModifiers);
+        Environment.SetEnvironmentVariable("START_STOP_HOTKEY_KEY", StartStopHotkeyKey);
+        Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_MODIFIERS", OverlayHotkeyModifiers);
+        Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_KEY", OverlayHotkeyKey);
     }
 
     public ITranslationService? CreateTranslationService(System.Net.Http.HttpClient httpClient)

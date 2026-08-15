@@ -15,16 +15,6 @@ namespace LoopbackRecorder;
 /// </summary>
 public sealed class HotkeyManager : IDisposable
 {
-    [Flags]
-    public enum Modifiers : uint
-    {
-        None = 0x0000,
-        Alt = 0x0001,
-        Control = 0x0002,
-        Shift = 0x0004,
-        Win = 0x0008,
-    }
-
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -49,8 +39,11 @@ public sealed class HotkeyManager : IDisposable
     }
 
     /// <summary>キーの組み合わせにハンドラーを登録する。同じ組み合わせが他アプリで
-    /// 既に使われている場合は例外を投げる(呼び出し側でcatchして続行することを想定)</summary>
-    public void Register(Modifiers modifiers, Key key, Action handler)
+    /// 既に使われている場合は例外を投げる(呼び出し側でcatchして続行することを想定)。
+    /// modifiersにはSystem.Windows.Input.ModifierKeysをそのまま渡せる
+    /// (Alt=1, Control=2, Shift=4, Windows=8で、Win32のMOD_ALT/MOD_CONTROL/MOD_SHIFT/MOD_WINと
+    /// ビット値が一致するため、変換なしでRegisterHotKeyのfsModifiersへ渡せる)。</summary>
+    public void Register(ModifierKeys modifiers, Key key, Action handler)
     {
         int id = _nextId++;
         uint vk = (uint)KeyInterop.VirtualKeyFromKey(key);
