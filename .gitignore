@@ -3,7 +3,7 @@ bin/
 obj/
 *.user
 .vs/
-.zip
+*.zip
 
 # APIキーなど秘密情報(.env.exampleだけコミットする)
 .env
