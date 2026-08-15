@@ -3,8 +3,12 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 
 namespace LoopbackRecorder;
+
+/// <summary>原文/訳文リストの1行分。タイムスタンプと本文を別々に色分け表示するために使う</summary>
+public record TranscriptLine(string Timestamp, string Text);
 
 public partial class MainWindow : Window
 {
@@ -23,7 +27,7 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() =>
             {
-                OriginalListBox.Items.Add(text);
+                OriginalListBox.Items.Add(new TranscriptLine(DateTime.Now.ToString("HH:mm:ss"), text));
                 OriginalListBox.ScrollIntoView(OriginalListBox.Items[^1]);
             });
         };
@@ -32,7 +36,7 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() =>
             {
-                TranslatedListBox.Items.Add(text);
+                TranslatedListBox.Items.Add(new TranscriptLine(DateTime.Now.ToString("HH:mm:ss"), text));
                 TranslatedListBox.ScrollIntoView(TranslatedListBox.Items[^1]);
                 _overlayWindow?.AddTranslatedLine(text);
             });
@@ -49,24 +53,26 @@ public partial class MainWindow : Window
         if (_isRunning)
         {
             _cts?.Cancel();
-            StartStopButton.Content = "開始";
-            _isRunning = false;
+            SetRunningUiState(false);
             return;
         }
 
         // 設定画面で更新済みの_settingsをそのまま使う(ここで再読み込みすると
         // 設定画面での変更が.envの保存内容次第で上書きされてしまうため)
-        _pipeline.EnergyThreshold = _settings.VadThreshold;
+        // ゲーム音声優先モードがONの場合、VAD閾値を引き上げて小さい雑音より
+        // 大きいゲーム音声を優先的に拾うようにする
+        _pipeline.EnergyThreshold = _settings.GameAudioPriorityMode
+            ? _settings.VadThreshold * 1.5f
+            : _settings.VadThreshold;
         _pipeline.ConfigureTranslation(_settings.CreateTranslationService(_httpClient));
 
         _cts = new CancellationTokenSource();
-        _isRunning = true;
-        StartStopButton.Content = "停止";
+        SetRunningUiState(true);
         StatusText.Text = "起動中...";
 
         try
         {
-            await _pipeline.RunAsync(_settings.DeviceKeyword, _settings.WhisperModelPath, _cts.Token);
+            await _pipeline.RunAsync(_settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -78,8 +84,21 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _isRunning = false;
-            StartStopButton.Content = "開始";
+            SetRunningUiState(false);
+        }
+    }
+
+    private void SetRunningUiState(bool running)
+    {
+        _isRunning = running;
+        StartStopLabel.Text = running ? "翻訳停止" : "翻訳開始";
+        StartStopIcon.Text = running ? "\uE71A" : "\uE768"; // 停止アイコン / 再生アイコン
+        StatusDot.Fill = running
+            ? new SolidColorBrush(Color.FromRgb(0x29, 0xC7, 0xC1))
+            : new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x77));
+        if (!running)
+        {
+            StatusText.Text = "停止中";
         }
     }
 
@@ -89,6 +108,7 @@ public partial class MainWindow : Window
         if (settingsWindow.ShowDialog() == true)
         {
             _settings = settingsWindow.Settings;
+            _overlayWindow?.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines);
         }
     }
 
@@ -104,6 +124,7 @@ public partial class MainWindow : Window
         if (_overlayWindow == null || !_overlayWindow.IsVisible)
         {
             _overlayWindow ??= new OverlayWindow();
+            _overlayWindow.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines);
             _overlayWindow.Show();
         }
         else

@@ -1,23 +1,89 @@
 <Window x:Class="LoopbackRecorder.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="ゲーム音声リアルタイム翻訳" Height="600" Width="900"
-        Background="#1e1e1e">
-    <Grid Margin="12">
+        Title="ゲーム音声リアルタイム翻訳" Height="640" Width="960"
+        Background="#12121a">
+
+    <Window.Resources>
+        <LinearGradientBrush x:Key="AccentGradient" StartPoint="0,0" EndPoint="1,0">
+            <GradientStop Color="#29C7C1" Offset="0"/>
+            <GradientStop Color="#7B5FE0" Offset="1"/>
+        </LinearGradientBrush>
+
+        <Style x:Key="IconButton" TargetType="Button">
+            <Setter Property="Background" Value="#1e1e29"/>
+            <Setter Property="Foreground" Value="#e6e6f0"/>
+            <Setter Property="BorderBrush" Value="#33334a"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource IconButton}">
+            <Setter Property="Background" Value="{StaticResource AccentGradient}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+        </Style>
+
+        <LinearGradientBrush x:Key="PanelGradient" StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Color="#1c1c28" Offset="0"/>
+            <GradientStop Color="#16161f" Offset="1"/>
+        </LinearGradientBrush>
+    </Window.Resources>
+
+    <Grid Margin="16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <!-- 上部: ステータスと操作ボタン -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
-            <Button x:Name="StartStopButton" Content="開始" Width="100" Height="32" Click="StartStopButton_Click"/>
-            <Button x:Name="SettingsButton" Content="設定" Width="100" Height="32" Margin="8,0,0,0" Click="SettingsButton_Click"/>
-            <Button x:Name="ClearButton" Content="クリア" Width="100" Height="32" Margin="8,0,0,0" Click="ClearButton_Click"/>
-            <Button x:Name="OverlayButton" Content="オーバーレイ表示" Width="120" Height="32" Margin="8,0,0,0" Click="OverlayButton_Click"/>
-            <TextBlock x:Name="StatusText" Text="停止中" VerticalAlignment="Center" Margin="16,0,0,0" Foreground="#aaaaaa"/>
-        </StackPanel>
+        <!-- 上部: 操作バー -->
+        <Border Grid.Row="0" Background="#1a1a24" CornerRadius="10" Padding="12" Margin="0,0,0,12">
+            <DockPanel LastChildFill="False">
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+                    <Button x:Name="StartStopButton" Style="{StaticResource PrimaryButton}" Width="120" Click="StartStopButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock x:Name="StartStopIcon" FontFamily="Segoe MDL2 Assets" Text="&#xE768;" Margin="0,0,6,0"/>
+                            <TextBlock x:Name="StartStopLabel" Text="翻訳開始"/>
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="SettingsButton" Style="{StaticResource IconButton}" Width="110" Margin="8,0,0,0" Click="SettingsButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE713;" Margin="0,0,6,0"/>
+                            <TextBlock Text="音声設定"/>
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="ClearButton" Style="{StaticResource IconButton}" Width="110" Margin="8,0,0,0" Click="ClearButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE74D;" Margin="0,0,6,0"/>
+                            <TextBlock Text="履歴クリア"/>
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="OverlayButton" Style="{StaticResource IconButton}" Width="130" Margin="8,0,0,0" Click="OverlayButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE7F4;" Margin="0,0,6,0"/>
+                            <TextBlock Text="オーバーレイ表示"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                    <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#666677" Margin="0,0,6,0"/>
+                    <TextBlock x:Name="StatusText" Text="停止中" VerticalAlignment="Center" Foreground="#aaaaba"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
 
         <!-- 中央: 原文/訳文の2ペイン -->
         <Grid Grid.Row="1">
@@ -26,21 +92,45 @@
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <Border Grid.Column="0" BorderBrush="#444444" BorderThickness="1" Margin="0,0,4,0">
+            <Border Grid.Column="0" Background="{StaticResource PanelGradient}" BorderBrush="#2a2a3a" BorderThickness="1"
+                    CornerRadius="10" Margin="0,0,6,0">
                 <DockPanel>
-                    <TextBlock DockPanel.Dock="Top" Text="原文" FontWeight="Bold" Foreground="White"
-                               Background="#2d2d2d" Padding="8"/>
-                    <ListBox x:Name="OriginalListBox" Background="#252525" Foreground="White"
-                             BorderThickness="0" FontSize="14"/>
+                    <Border DockPanel.Dock="Top" CornerRadius="10,10,0,0" Background="#22222f" Padding="12,10">
+                        <TextBlock Text="原文" FontWeight="Bold" Foreground="White"/>
+                    </Border>
+                    <ListBox x:Name="OriginalListBox" Background="Transparent" Foreground="#b0b0b8"
+                             BorderThickness="0" FontSize="14" Padding="8">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock TextWrapping="Wrap">
+                                    <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
+                                    <LineBreak/>
+                                    <Run Text="{Binding Text}" Foreground="#b0b0b8"/>
+                                </TextBlock>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
                 </DockPanel>
             </Border>
 
-            <Border Grid.Column="1" BorderBrush="#444444" BorderThickness="1" Margin="4,0,0,0">
+            <Border Grid.Column="1" Background="{StaticResource PanelGradient}" BorderBrush="#2a2a3a" BorderThickness="1"
+                    CornerRadius="10" Margin="6,0,0,0">
                 <DockPanel>
-                    <TextBlock DockPanel.Dock="Top" Text="訳文" FontWeight="Bold" Foreground="White"
-                               Background="#2d2d2d" Padding="8"/>
-                    <ListBox x:Name="TranslatedListBox" Background="#252525" Foreground="#8ecbff"
-                             BorderThickness="0" FontSize="14"/>
+                    <Border DockPanel.Dock="Top" CornerRadius="10,10,0,0" Background="#22222f" Padding="12,10">
+                        <TextBlock Text="訳文" FontWeight="Bold" Foreground="White"/>
+                    </Border>
+                    <ListBox x:Name="TranslatedListBox" Background="Transparent" Foreground="#ffffff"
+                             BorderThickness="0" FontSize="14" Padding="8">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock TextWrapping="Wrap">
+                                    <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
+                                    <LineBreak/>
+                                    <Run Text="{Binding Text}" Foreground="#ffffff"/>
+                                </TextBlock>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
                 </DockPanel>
             </Border>
         </Grid>

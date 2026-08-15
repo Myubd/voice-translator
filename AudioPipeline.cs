@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -19,10 +19,11 @@ public class AudioPipeline
 {
     // ==== VAD(発話区間検出)まわりのパラメータ ====
     const int SampleRate = 16000;
-    const int ChunkSamples = 480;          // 16kHzで30ms分
-    const int SilenceChunksToEndSpeech = 17; // 約500ms無音が続いたら発話終了とみなす
-    const int MinSpeechChunks = 25;        // 約750ms未満の短い音は雑音として破棄(短すぎると言語判定を誤りやすいため長めに)
-    const int MaxSpeechChunks = 500;       // 約15秒で強制的に区切る
+    const int ChunkSamples = 480;            // 16kHzで30ms分
+    const int SilenceChunksToEndSpeech = 14; // 約420ms無音が続いたら発話終了とみなす(遅延短縮のため500ms→420ms)
+    const int MinSpeechChunks = 15;          // 約450ms未満の短い音は雑音として破棄(Yes/No等の短い発話も拾えるよう750ms→450msに短縮)
+    const int MaxSpeechChunks = 500;         // 約15秒で強制的に区切る
+    const int PrerollChunks = 13;            // 発話開始前の約390msを先頭に付与し、頭切れを防ぐ
 
     public float EnergyThreshold { get; set; } = 0.015f;
 
@@ -30,7 +31,6 @@ public class AudioPipeline
     public event Action<string>? TranslatedTextReceived;
     public event Action<string>? StatusChanged;
 
-    private readonly HttpClient _httpClient = new HttpClient();
     private WhisperProcessor? _processor;
     private ITranslationService? _translationService;
 
@@ -52,7 +52,7 @@ public class AudioPipeline
         _translationService = service;
     }
 
-    public async Task RunAsync(string deviceKeyword, string modelPath, CancellationToken cancellationToken)
+    public async Task RunAsync(string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, CancellationToken cancellationToken)
     {
         var enumerator = new MMDeviceEnumerator();
         var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
@@ -65,16 +65,29 @@ public class AudioPipeline
             return;
         }
 
-        if (!File.Exists(modelPath))
+        // exeがどのディレクトリから起動されても見つかるよう、相対パスは実行ファイルの場所を基準に解決する
+        string resolvedModelPath = Path.IsPathRooted(modelPath)
+            ? modelPath
+            : Path.Combine(AppContext.BaseDirectory, modelPath);
+
+        if (!File.Exists(resolvedModelPath))
         {
-            StatusChanged?.Invoke($"モデルファイルが見つかりません: {modelPath}");
+            StatusChanged?.Invoke($"モデルファイルが見つかりません: {resolvedModelPath}");
             return;
         }
 
-        using var whisperFactory = WhisperFactory.FromPath(modelPath);
-        var processor = whisperFactory.CreateBuilder()
-            .WithLanguage("auto")
-            .Build();
+        using var whisperFactory = WhisperFactory.FromPath(resolvedModelPath);
+        var processorBuilder = whisperFactory.CreateBuilder()
+            .WithLanguage(string.IsNullOrWhiteSpace(recognitionLanguage) ? "auto" : recognitionLanguage)
+            .WithThreads(Math.Max(2, Environment.ProcessorCount / 2)); // CPUコア数に応じてスレッド数を明示指定
+
+        if (!string.IsNullOrWhiteSpace(whisperPrompt))
+        {
+            // 固有名詞などのヒントをWhisperに渡し、認識精度の向上を狙う
+            processorBuilder = processorBuilder.WithPrompt(whisperPrompt);
+        }
+
+        var processor = processorBuilder.Build();
         _processor = processor;
 
         using var capture = new WasapiLoopbackCapture(target);
@@ -116,17 +129,32 @@ public class AudioPipeline
                 await Task.Delay(1000, cancellationToken);
             }
         }
+        // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく
+        if (_translationService != null)
+        {
+            StatusChanged?.Invoke("翻訳の準備中(用語集を抽出しています)...");
+            await _translationService.PrepareAsync();
+        }
+
         StatusChanged?.Invoke($"認識中: {target.FriendlyName}");
+
+        // Whisper処理を1本のキューで順番に処理するためのチャンネル。
+        // これにより、発話が連続しても複数のWhisper推論が同時実行されてリソースを
+        // 奪い合うことがなくなる(翻訳は引き続き並行実行して問題ない)。
+        // 発話が連続すると処理待ちが溜まっていくため、キューに上限を設ける。
+        // 上限を超えたら「一番古い(=もう鮮度が落ちている)」セグメントを捨てて、
+        // 遅延がどこまでも蓄積し続けるのを防ぐ
+        var segmentChannel = Channel.CreateBounded<float[]>(new BoundedChannelOptions(5)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+        var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, cancellationToken);
 
         var readBuffer = new float[ChunkSamples];
         var speechBuffer = new List<float>();
+        var prerollBuffer = new Queue<float[]>();
         int silenceChunkCount = 0;
         bool inSpeech = false;
-
-        // バックグラウンドで実行中の文字起こしタスクを追跡する。
-        // 停止時にこれらが終わるのを待ってからWhisperプロセッサを破棄しないと、
-        // 「処理中にDisposeしようとした」エラーになる。
-        var pendingTranscriptions = new List<Task>();
 
         try
         {
@@ -153,6 +181,12 @@ public class AudioPipeline
                     {
                         inSpeech = true;
                         speechBuffer.Clear();
+                        // 発話開始の瞬間、直前まで無音だと思って捨てていた分(プリロール)を
+                        // 先頭に付与することで、語頭の欠落を防ぐ
+                        foreach (var chunk in prerollBuffer)
+                        {
+                            speechBuffer.AddRange(chunk);
+                        }
                     }
                     speechBuffer.AddRange(readBuffer.Take(read));
                     silenceChunkCount = 0;
@@ -170,12 +204,19 @@ public class AudioPipeline
                         inSpeech = false;
                         if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
                         {
-                            var segment = speechBuffer.ToArray();
-                            var task = TranscribeSegmentAsync(segment);
-                            pendingTranscriptions.Add(task);
-                            pendingTranscriptions.RemoveAll(t => t.IsCompleted);
+                            segmentChannel.Writer.TryWrite(speechBuffer.ToArray());
                         }
                         speechBuffer.Clear();
+                    }
+                }
+
+                // 発話中でない間も、直近のチャンクを常にプリロール用バッファに保持しておく
+                if (!inSpeech)
+                {
+                    prerollBuffer.Enqueue(readBuffer.Take(read).ToArray());
+                    while (prerollBuffer.Count > PrerollChunks)
+                    {
+                        prerollBuffer.Dequeue();
                     }
                 }
             }
@@ -184,21 +225,45 @@ public class AudioPipeline
         {
             capture.StopRecording();
 
-            // 実行中の文字起こし処理が残っている状態でプロセッサを破棄すると
-            // 「Cannot dispose while processing」エラーになるため、完了を待つ
+            // キューへの書き込みを締め切り、溜まっている分の処理が終わるのを待ってから
+            // Whisperプロセッサを破棄する(処理中に破棄すると例外になるため)
+            segmentChannel.Writer.Complete();
             try
             {
-                await Task.WhenAll(pendingTranscriptions);
+                await whisperWorkerTask;
             }
             catch
             {
-                // 個々のタスクの例外はここでは無視する(処理自体は継続不要なため)
+                // ワーカー内の例外はここでは無視する(処理自体は継続不要なため)
             }
 
             await processor.DisposeAsync();
             _processor = null;
 
             StatusChanged?.Invoke("停止しました");
+        }
+    }
+
+    /// <summary>
+    /// キューに積まれた音声区間を1本ずつ順番に文字起こしする。
+    /// Whisperの推論を同時に複数走らせないことで、CPU/GPUリソースの奪い合いを防ぐ。
+    /// </summary>
+    private async Task RunWhisperWorkerAsync(ChannelReader<float[]> reader, CancellationToken cancellationToken)
+    {
+        await foreach (var segment in reader.ReadAllAsync(cancellationToken))
+        {
+            try
+            {
+                await TranscribeSegmentAsync(segment);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // 1区間の失敗で全体を止めないよう、ここでは無視して次に進む
+            }
         }
     }
 

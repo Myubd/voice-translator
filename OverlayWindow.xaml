@@ -12,8 +12,11 @@
         MouseLeftButtonDown="Window_MouseLeftButtonDown">
     <Grid>
         <!-- 半透明の背景。ゲーム画面が透けて見えるようにする -->
-        <Border Background="#B0000000" CornerRadius="8" BorderBrush="#55FFFFFF" BorderThickness="1">
-            <Grid Margin="12">
+        <Border x:Name="BackgroundBorder" Background="#B0000000" CornerRadius="16" BorderBrush="#5529C7C1" BorderThickness="1.5">
+            <Border.Effect>
+                <DropShadowEffect Color="#29C7C1" BlurRadius="18" ShadowDepth="0" Opacity="0.35"/>
+            </Border.Effect>
+            <Grid Margin="14">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
@@ -48,8 +51,9 @@
                     </ListBox.ItemContainerStyle>
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <TextBlock Text="{Binding}" Foreground="White" FontSize="22" FontWeight="Bold"
-                                       TextWrapping="Wrap" TextAlignment="Center" Margin="0,2"/>
+                            <TextBlock Text="{Binding}" Foreground="White"
+                                       FontSize="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=Tag}"
+                                       FontWeight="Bold" TextWrapping="Wrap" TextAlignment="Center" Margin="0,2"/>
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
