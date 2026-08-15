@@ -3,7 +3,19 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
+
+/// <summary>
+/// 翻訳結果。成功時はTextに訳文が入り、失敗時はErrorMessageにユーザー向けの理由が入る。
+/// 従来はfailure時にnullを返すだけでエラー内容がConsole.WriteLineにしか出ておらず、
+/// WPFアプリとして配布した場合ユーザーからは見えなかった。
+/// </summary>
+public record TranslationResult(string? Text, string? ErrorMessage)
+{
+    public static TranslationResult Success(string text) => new(text, null);
+    public static TranslationResult Failure(string errorMessage) => new(null, errorMessage);
+}
 
 /// <summary>
 /// 翻訳サービスの共通インターフェース。
@@ -12,7 +24,7 @@ using System.Threading.Tasks;
 /// </summary>
 public interface ITranslationService
 {
-    Task<string?> TranslateAsync(string text);
+    Task<TranslationResult> TranslateAsync(string text);
 
     /// <summary>セッション開始時に一度だけ呼ばれる準備処理。既定では何もしない</summary>
     Task PrepareAsync() => Task.CompletedTask;
@@ -39,7 +51,12 @@ public class DeepLTranslationService : ITranslationService
             : "https://api.deepl.com/v2/translate";
     }
 
-    public async Task<string?> TranslateAsync(string text)
+    // DeepLがハングした場合に翻訳ワーカー全体が無期限に止まらないよう、要求ごとにタイムアウトを設ける。
+    // HttpClient自体はMainWindow側でアプリ全体で共有されているため、Timeoutプロパティを直接変えず、
+    // 呼び出しごとにCancellationTokenSourceで打ち切る形にする。
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
+
+    public async Task<TranslationResult> TranslateAsync(string text)
     {
         try
         {
@@ -53,27 +70,44 @@ public class DeepLTranslationService : ITranslationService
             request.Headers.Add("Authorization", $"DeepL-Auth-Key {_apiKey}");
             request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
 
-            using var response = await _httpClient.SendAsync(request);
+            using var timeoutCts = new CancellationTokenSource(RequestTimeout);
+            using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
-                Console.WriteLine($"[DeepLエラー] HTTP {(int)response.StatusCode}: {errorBody}");
-                return null;
+                Logger.Log("DeepL", $"HTTP {(int)response.StatusCode}: {errorBody}");
+                return TranslationResult.Failure(BuildUserFacingError((int)response.StatusCode));
             }
 
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
             var translations = doc.RootElement.GetProperty("translations");
-            return translations.GetArrayLength() > 0
+            var translated = translations.GetArrayLength() > 0
                 ? translations[0].GetProperty("text").GetString()
                 : null;
+
+            return translated != null
+                ? TranslationResult.Success(translated)
+                : TranslationResult.Failure("DeepLから翻訳結果を取得できませんでした。");
+        }
+        catch (OperationCanceledException ex)
+        {
+            Logger.Log("DeepL", "リクエストがタイムアウトしました。", ex);
+            return TranslationResult.Failure("DeepLへの接続がタイムアウトしました。ネットワークを確認してください。");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[DeepLエラー] {ex.Message}");
-            return null;
+            Logger.Log("DeepL", "翻訳リクエストで例外が発生しました。", ex);
+            return TranslationResult.Failure($"DeepLへの接続に失敗しました: {ex.Message}");
         }
     }
+
+    private static string BuildUserFacingError(int statusCode) => statusCode switch
+    {
+        401 or 403 => "DeepL APIキーが正しくないか、権限がありません。設定画面で確認してください。",
+        429 or 456 => "DeepLの利用上限に達しました(無料/有料プランの制限)。",
+        _ => $"DeepLへのリクエストが失敗しました(HTTP {statusCode})。"
+    };
 }
 
 /// <summary>
@@ -148,9 +182,11 @@ public class OllamaTranslationService : ITranslationService
             // 暴走防止のため、万一異常に長い応答が返ってきた場合は安全のため使わない
             _glossary = (!string.IsNullOrWhiteSpace(extracted) && extracted.Length < 3000) ? extracted : null;
         }
-        catch
+        catch (Exception ex)
         {
-            // 抽出に失敗しても翻訳自体は続行できるようにする(コンテキスト無しにフォールバック)
+            // 抽出に失敗しても翻訳自体は続行できるようにする(コンテキスト無しにフォールバック)。
+            // ただし「なぜ用語集が反映されないのか」が分かるよう原因は記録しておく
+            Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。用語集無しで続行します。", ex);
             _glossary = null;
         }
     }
@@ -176,7 +212,11 @@ public class OllamaTranslationService : ITranslationService
         return models;
     }
 
-    public async Task<string?> TranslateAsync(string text)
+    // ローカルLLMは応答が遅いことがあるためDeepLより長めに取るが、ハングしたまま
+    // 無期限に翻訳ワーカーを止めないよう上限は設ける。
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+
+    public async Task<TranslationResult> TranslateAsync(string text)
     {
         try
         {
@@ -211,22 +251,37 @@ public class OllamaTranslationService : ITranslationService
             using var request = new HttpRequestMessage(HttpMethod.Post, $"{_endpoint}/api/generate");
             request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
 
-            using var response = await _httpClient.SendAsync(request);
+            using var timeoutCts = new CancellationTokenSource(RequestTimeout);
+            using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
-                Console.WriteLine($"[Ollamaエラー] HTTP {(int)response.StatusCode}: {errorBody}");
-                return null;
+                Logger.Log("Ollama", $"HTTP {(int)response.StatusCode}: {errorBody}");
+                return TranslationResult.Failure($"Ollamaへのリクエストが失敗しました(HTTP {(int)response.StatusCode})。モデル名を確認してください。");
             }
 
             var json = await response.Content.ReadAsStringAsync();
             using var doc = JsonDocument.Parse(json);
-            return doc.RootElement.GetProperty("response").GetString()?.Trim();
+            var translated = doc.RootElement.GetProperty("response").GetString()?.Trim();
+
+            return !string.IsNullOrWhiteSpace(translated)
+                ? TranslationResult.Success(translated!)
+                : TranslationResult.Failure("Ollamaから翻訳結果を取得できませんでした。");
+        }
+        catch (OperationCanceledException ex)
+        {
+            Logger.Log("Ollama", "リクエストがタイムアウトしました。", ex);
+            return TranslationResult.Failure("Ollamaへの接続がタイムアウトしました。Ollamaが起動しているか確認してください。");
+        }
+        catch (HttpRequestException ex)
+        {
+            Logger.Log("Ollama", "Ollamaへの接続に失敗しました。", ex);
+            return TranslationResult.Failure("Ollamaに接続できません。Ollamaが起動しているか確認してください。");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Ollamaエラー] {ex.Message}");
-            return null;
+            Logger.Log("Ollama", "翻訳リクエストで例外が発生しました。", ex);
+            return TranslationResult.Failure($"Ollamaでの翻訳に失敗しました: {ex.Message}");
         }
     }
 }

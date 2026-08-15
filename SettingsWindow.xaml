@@ -102,6 +102,20 @@
                         <Slider x:Name="VadThresholdSlider" Minimum="0.001" Maximum="0.05" TickFrequency="0.001"
                                 Value="0.015" IsMoveToPointEnabled="True" Margin="0,0,0,8"/>
 
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="発話継続のしやすさ(ヒステリシス)" Style="{StaticResource FieldLabel}"/>
+                            <TextBlock Grid.Column="1" Foreground="#4da6ff" FontWeight="Bold"
+                                       Text="{Binding ElementName=VadHysteresisSlider, Path=Value, StringFormat='{}{0:F2}'}"/>
+                        </Grid>
+                        <Slider x:Name="VadHysteresisSlider" Minimum="0.2" Maximum="1.0" TickFrequency="0.05"
+                                Value="0.6" IsMoveToPointEnabled="True" Margin="0,0,0,4"/>
+                        <TextBlock Text="小さくするほど、一度話し始めた発話は多少声が小さくなっても『継続中』とみなされやすくなり、息継ぎなどでの意図しない分断を抑えられます。1.0で従来と同じ挙動(単一閾値)になります"
+                                   Style="{StaticResource HelpText}"/>
+
                         <CheckBox x:Name="GameAudioPriorityCheckBox" Content="ゲーム音声優先モード(小さい雑音より大きい音声を優先)"
                                   Foreground="#cccccc" Margin="0,0,0,16"/>
                     </StackPanel>
@@ -143,7 +157,22 @@
 
                         <StackPanel x:Name="DeepLPanel">
                             <TextBlock Text="DeepL APIキー" Style="{StaticResource FieldLabel}"/>
-                            <TextBox x:Name="DeepLApiKeyTextBox" Margin="0,0,0,16"/>
+                            <Grid Margin="0,0,0,16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <!-- 既定はPasswordBoxで表示(画面共有・配信中の映り込み対策)。
+                                     必要な場合のみ「表示」トグルで平文のTextBoxに切り替える -->
+                                <PasswordBox x:Name="DeepLApiKeyPasswordBox" Grid.Column="0"
+                                             PasswordChanged="DeepLApiKeyPasswordBox_PasswordChanged"/>
+                                <TextBox x:Name="DeepLApiKeyTextBox" Grid.Column="0" Visibility="Collapsed"
+                                         TextChanged="DeepLApiKeyTextBox_TextChanged"/>
+                                <ToggleButton x:Name="DeepLApiKeyVisibilityToggle" Grid.Column="1"
+                                              Content="表示" Width="52" Margin="6,0,0,0"
+                                              Checked="DeepLApiKeyVisibilityToggle_Checked"
+                                              Unchecked="DeepLApiKeyVisibilityToggle_Unchecked"/>
+                            </Grid>
                         </StackPanel>
 
                         <StackPanel x:Name="OllamaPanel">

@@ -26,6 +26,12 @@ public static class LanguageCatalog
     public static readonly List<LanguageOption> TargetLanguages =
         SourceLanguages.Where(l => l.WhisperCode != "auto").ToList();
 
+    /// <summary>既定(フォールバック)言語。日本語をコードで明示的に指定する。
+    /// 以前はTargetLanguages[1]という配列インデックス依存だったため、リストの並び順を変えると
+    /// 意図せず既定言語が変わってしまう問題があった。</summary>
+    private static readonly LanguageOption DefaultTargetLanguage =
+        TargetLanguages.First(l => l.DeepLCode == "JA");
+
     public static LanguageOption FindByDeepLCode(string deepLCode) =>
-        TargetLanguages.FirstOrDefault(l => l.DeepLCode == deepLCode) ?? TargetLanguages[1]; // 既定は日本語
+        TargetLanguages.FirstOrDefault(l => l.DeepLCode == deepLCode) ?? DefaultTargetLanguage;
 }

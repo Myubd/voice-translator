@@ -12,20 +12,26 @@ public partial class SettingsWindow : Window
     public AppSettings Settings { get; private set; }
     private readonly HttpClient _httpClient = new HttpClient();
 
+    // DeepL APIキーはPasswordBox/TextBoxを表示切り替えで共有するため、値そのものはここで一元管理する
+    private string _deepLApiKey = "";
+
     public SettingsWindow(AppSettings currentSettings)
     {
         InitializeComponent();
         Settings = currentSettings;
 
-        // デバイス一覧を読み込み、現在のキーワードに一致するものを選択状態にする
-        var deviceNames = AudioPipeline.GetAvailableDeviceNames();
-        foreach (var name in deviceNames)
-        {
-            DeviceComboBox.Items.Add(name);
-        }
-        var matchedDevice = deviceNames.FirstOrDefault(
-            n => n.Contains(Settings.DeviceKeyword, System.StringComparison.OrdinalIgnoreCase));
-        DeviceComboBox.SelectedItem = matchedDevice ?? deviceNames.FirstOrDefault();
+        // デバイス一覧を読み込む。保存済みのDeviceId(一意なOS識別子)があればそれを優先して選択し、
+        // 無ければ従来どおり名前の部分一致にフォールバックする(同名デバイスが複数ある場合の誤選択を避けるため)
+        var devices = AudioPipeline.GetAvailableDevices();
+        DeviceComboBox.ItemsSource = devices;
+        DeviceComboBox.DisplayMemberPath = nameof(AudioDeviceInfo.Name);
+
+        var matchedDevice = !string.IsNullOrWhiteSpace(Settings.DeviceId)
+            ? devices.FirstOrDefault(d => d.Id == Settings.DeviceId)
+            : null;
+        matchedDevice ??= devices.FirstOrDefault(
+            d => d.Name.Contains(Settings.DeviceKeyword, System.StringComparison.OrdinalIgnoreCase));
+        DeviceComboBox.SelectedItem = matchedDevice ?? devices.FirstOrDefault();
 
         // Whisperモデルファイル(ggml-*.bin)を自動検出してドロップダウンに反映
         var modelFiles = System.IO.Directory.Exists(".")
@@ -47,10 +53,12 @@ public partial class SettingsWindow : Window
 
         // テキストボックス類を先にセットしておく(バックエンド選択の復元がイベントを発火させ、
         // その中でエンドポイント値を参照するモデル一覧取得が走るため、先に値を確定させる必要がある)
-        DeepLApiKeyTextBox.Text = Settings.DeepLApiKey;
+        _deepLApiKey = Settings.DeepLApiKey;
+        DeepLApiKeyPasswordBox.Password = _deepLApiKey;
         OllamaModelComboBox.Text = Settings.OllamaModel;
         OllamaEndpointTextBox.Text = Settings.OllamaEndpoint;
         VadThresholdSlider.Value = Settings.VadThreshold;
+        VadHysteresisSlider.Value = Settings.VadHysteresisRatio;
         GameAudioPriorityCheckBox.IsChecked = Settings.GameAudioPriorityMode;
         OverlayFontSizeSlider.Value = Settings.OverlayFontSize;
         OverlayOpacitySlider.Value = Settings.OverlayOpacity;
@@ -84,6 +92,7 @@ public partial class SettingsWindow : Window
         }
         catch (System.Exception ex)
         {
+            Logger.Log("SettingsWindow", "Ollamaモデル一覧の取得に失敗しました。", ex);
             StatusText.Text = $"Ollamaのモデル一覧を取得できませんでした: {ex.Message}";
             return;
         }
@@ -109,6 +118,31 @@ public partial class SettingsWindow : Window
         {
             StatusText.Text = "Ollamaにモデルがインストールされていないようです";
         }
+    }
+
+    private void DeepLApiKeyPasswordBox_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        _deepLApiKey = DeepLApiKeyPasswordBox.Password;
+    }
+
+    private void DeepLApiKeyTextBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        _deepLApiKey = DeepLApiKeyTextBox.Text;
+    }
+
+    /// <summary>「表示」トグルON: 画面共有中などに気付けるよう、既定では隠しているキーを平文表示に切り替える</summary>
+    private void DeepLApiKeyVisibilityToggle_Checked(object sender, RoutedEventArgs e)
+    {
+        DeepLApiKeyTextBox.Text = _deepLApiKey;
+        DeepLApiKeyTextBox.Visibility = Visibility.Visible;
+        DeepLApiKeyPasswordBox.Visibility = Visibility.Collapsed;
+    }
+
+    private void DeepLApiKeyVisibilityToggle_Unchecked(object sender, RoutedEventArgs e)
+    {
+        DeepLApiKeyPasswordBox.Password = _deepLApiKey;
+        DeepLApiKeyPasswordBox.Visibility = Visibility.Visible;
+        DeepLApiKeyTextBox.Visibility = Visibility.Collapsed;
     }
 
     private void BackendComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -148,13 +182,18 @@ public partial class SettingsWindow : Window
 
     private void SaveButton_Click(object sender, RoutedEventArgs e)
     {
-        Settings.DeviceKeyword = DeviceComboBox.SelectedItem as string ?? Settings.DeviceKeyword;
+        if (DeviceComboBox.SelectedItem is AudioDeviceInfo selectedDevice)
+        {
+            Settings.DeviceId = selectedDevice.Id;
+            Settings.DeviceKeyword = selectedDevice.Name;
+        }
         Settings.WhisperModelPath = WhisperModelComboBox.Text;
         Settings.TranslationBackend = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deepl";
-        Settings.DeepLApiKey = DeepLApiKeyTextBox.Text;
+        Settings.DeepLApiKey = _deepLApiKey;
         Settings.OllamaModel = OllamaModelComboBox.Text;
         Settings.OllamaEndpoint = OllamaEndpointTextBox.Text;
         Settings.VadThreshold = (float)VadThresholdSlider.Value;
+        Settings.VadHysteresisRatio = (float)VadHysteresisSlider.Value;
         Settings.GameAudioPriorityMode = GameAudioPriorityCheckBox.IsChecked == true;
         Settings.OverlayFontSize = OverlayFontSizeSlider.Value;
         Settings.OverlayOpacity = OverlayOpacitySlider.Value;

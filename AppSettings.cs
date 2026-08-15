@@ -10,12 +10,21 @@ using System.Linq;
 public class AppSettings
 {
     public string DeviceKeyword { get; set; } = "Chat";
+
+    /// <summary>OS上で一意なデバイスID(MMDevice.ID)。設定画面でデバイスを選択すると保存される。
+    /// 名前の部分一致(DeviceKeyword)より優先して使われ、同名デバイスの誤選択を防ぐ。
+    /// 未設定、またはデバイス構成変更でIDが見つからない場合はDeviceKeywordにフォールバックする。</summary>
+    public string DeviceId { get; set; } = "";
     public string TranslationBackend { get; set; } = "deepl"; // "deepl" または "ollama"
     public string DeepLApiKey { get; set; } = "";
     public string OllamaModel { get; set; } = "llama3.1";
     public string OllamaEndpoint { get; set; } = "http://localhost:11434";
     public string WhisperModelPath { get; set; } = "ggml-base.bin";
     public float VadThreshold { get; set; } = 0.015f;
+
+    /// <summary>VADヒステリシス比率(0〜1)。発話継続中の「まだ話している」判定閾値を
+    /// 開始閾値(VadThreshold)からどれだけ下げるか。小さいほど息継ぎ等での分断が起きにくくなる。</summary>
+    public float VadHysteresisRatio { get; set; } = 0.6f;
 
     /// <summary>ONの場合、VAD閾値を引き上げ、小さい雑音より大きいゲーム音声を優先的に拾うようにする</summary>
     public bool GameAudioPriorityMode { get; set; } = false;
@@ -45,6 +54,7 @@ public class AppSettings
         var settings = new AppSettings
         {
             DeviceKeyword = Environment.GetEnvironmentVariable("DEVICE_KEYWORD") ?? "Chat",
+            DeviceId = Environment.GetEnvironmentVariable("DEVICE_ID") ?? "",
             TranslationBackend = Environment.GetEnvironmentVariable("TRANSLATION_BACKEND") ?? "deepl",
             DeepLApiKey = Environment.GetEnvironmentVariable("DEEPL_API_KEY") ?? "",
             OllamaModel = Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3.1",
@@ -56,6 +66,12 @@ public class AppSettings
         if (float.TryParse(vadThresholdStr, out var vadThreshold))
         {
             settings.VadThreshold = vadThreshold;
+        }
+
+        var vadHysteresisStr = Environment.GetEnvironmentVariable("VAD_HYSTERESIS_RATIO");
+        if (float.TryParse(vadHysteresisStr, out var vadHysteresisRatio))
+        {
+            settings.VadHysteresisRatio = vadHysteresisRatio;
         }
 
         if (bool.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE"), out var priorityMode))
@@ -90,11 +106,18 @@ public class AppSettings
 
         var lines = new List<string>
         {
-            "# 音声デバイス名に含まれるキーワード(例: CABLE, Chat)",
+            "# 音声デバイス名に含まれるキーワード(例: CABLE, Chat)。DEVICE_IDが見つからない場合のフォールバック用",
             $"DEVICE_KEYWORD={DeviceKeyword}",
+            "",
+            "# 音声デバイスの一意なID。設定画面でデバイスを選択すると自動的に保存される(手動編集非推奨)",
+            $"DEVICE_ID={DeviceId}",
             "",
             "# VAD(発話検出)の閾値",
             $"VAD_THRESHOLD={VadThreshold}",
+            "",
+            "# VADヒステリシス比率(0〜1)。発話継続中の判定閾値をVAD_THRESHOLDからどれだけ下げるか。",
+            "# 小さいほど、息継ぎ等の短い音量低下でセグメントが分断されにくくなる",
+            $"VAD_HYSTERESIS_RATIO={VadHysteresisRatio}",
             "",
             "# ゲーム音声優先モード(小さい雑音より大きい音声を優先的に拾う)",
             $"GAME_AUDIO_PRIORITY_MODE={GameAudioPriorityMode}",
@@ -136,7 +159,9 @@ public class AppSettings
 
         // 実行中のプロセスにもすぐ反映されるよう環境変数も更新する
         Environment.SetEnvironmentVariable("DEVICE_KEYWORD", DeviceKeyword);
+        Environment.SetEnvironmentVariable("DEVICE_ID", DeviceId);
         Environment.SetEnvironmentVariable("VAD_THRESHOLD", VadThreshold.ToString());
+        Environment.SetEnvironmentVariable("VAD_HYSTERESIS_RATIO", VadHysteresisRatio.ToString());
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE", GameAudioPriorityMode.ToString());
         Environment.SetEnvironmentVariable("OVERLAY_FONT_SIZE", OverlayFontSize.ToString());
         Environment.SetEnvironmentVariable("OVERLAY_OPACITY", OverlayOpacity.ToString());

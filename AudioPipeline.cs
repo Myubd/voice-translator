@@ -27,9 +27,25 @@ public class AudioPipeline
 
     public float EnergyThreshold { get; set; } = 0.015f;
 
+    /// <summary>
+    /// ヒステリシス比率(0〜1)。発話「開始」の判定にはEnergyThresholdをそのまま使うが、
+    /// 一度発話が始まった後は EnergyThreshold × HysteresisRatio という、より低い閾値で
+    /// 「まだ発話が続いている」とみなす。
+    /// これにより、閾値ギリギリの音量(息継ぎ・語尾の減衰など)で発話中に短時間だけRMSが
+    /// 下がった場合でも、そこで発話が終わったと誤判定してセグメントが分断されるのを防げる。
+    /// 値を下げるほど、一度始まった発話は多少音量が下がっても継続扱いされやすくなる
+    /// (=無音判定はより大きな音量低下があった時だけ働く)。
+    /// 1.0にすると従来と同じ単一閾値の挙動になる。
+    /// </summary>
+    public float HysteresisRatio { get; set; } = 0.6f;
+
     public event Action<string>? OriginalTextReceived;
     public event Action<string>? TranslatedTextReceived;
     public event Action<string>? StatusChanged;
+
+    /// <summary>翻訳API呼び出しが失敗した際に通知される(APIキー誤り、レート制限、ネットワーク断など)。
+    /// 従来はConsole.WriteLineのみで、配布したWPFアプリではユーザーから見えなかった。</summary>
+    public event Action<string>? TranslationErrorOccurred;
 
     private WhisperProcessor? _processor;
     private ITranslationService? _translationService;
@@ -38,12 +54,12 @@ public class AudioPipeline
     private string? _lastGlobalText;
     private DateTime _lastGlobalTime = DateTime.MinValue;
 
-    /// <summary>利用可能な出力(ループバック対象)デバイス名の一覧を取得する</summary>
-    public static List<string> GetAvailableDeviceNames()
+    /// <summary>利用可能な出力(ループバック対象)デバイスの一覧を、OS上で一意なIDと表示名のペアで取得する</summary>
+    public static List<AudioDeviceInfo> GetAvailableDevices()
     {
         var enumerator = new MMDeviceEnumerator();
         return enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-            .Select(d => d.FriendlyName)
+            .Select(d => new AudioDeviceInfo(d.ID, d.FriendlyName))
             .ToList();
     }
 
@@ -52,16 +68,27 @@ public class AudioPipeline
         _translationService = service;
     }
 
-    public async Task RunAsync(string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, CancellationToken cancellationToken)
+    public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, CancellationToken cancellationToken)
     {
         var enumerator = new MMDeviceEnumerator();
         var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
-        var target = devices.FirstOrDefault(
-            d => d.FriendlyName.Contains(deviceKeyword, StringComparison.OrdinalIgnoreCase));
+
+        // OS上で一意なDevice IDが保存されていればそれを最優先で使う(同名デバイスの誤選択を防ぐ)。
+        // ID未設定、またはデバイス構成が変わってIDが見つからない場合のみ、従来どおり名前の部分一致にフォールバックする。
+        MMDevice? target = null;
+        if (!string.IsNullOrWhiteSpace(deviceId))
+        {
+            target = devices.FirstOrDefault(d => d.ID == deviceId);
+        }
+        if (target == null && !string.IsNullOrWhiteSpace(deviceKeyword))
+        {
+            target = devices.FirstOrDefault(
+                d => d.FriendlyName.Contains(deviceKeyword, StringComparison.OrdinalIgnoreCase));
+        }
 
         if (target == null)
         {
-            StatusChanged?.Invoke($"'{deviceKeyword}' を含むデバイスが見つかりませんでした。");
+            StatusChanged?.Invoke($"'{deviceKeyword}' を含むデバイスが見つかりませんでした。設定画面でデバイスを選び直してください。");
             return;
         }
 
@@ -116,11 +143,13 @@ public class AudioPipeline
         // デバイスが他プロセス(Sonar等)と一時的に競合してエラーになることがあるため、
         // 数回リトライしてから諦める(Sonarを手動再起動しなくても自然に復帰することが多い)
         const int maxRetries = 5;
+        bool captureStarted = false;
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
             {
                 capture.StartRecording();
+                captureStarted = true;
                 break;
             }
             catch (System.Runtime.InteropServices.COMException) when (attempt < maxRetries)
@@ -129,6 +158,18 @@ public class AudioPipeline
                 await Task.Delay(1000, cancellationToken);
             }
         }
+
+        // 最終試行まで失敗した場合、ここで明示的に打ち切る。
+        // これを入れないと、録音が始まっていないまま後続のVADループへ進んでしまう
+        // (無音がずっと続くだけに見え、原因が分かりにくくなる)
+        if (!captureStarted)
+        {
+            StatusChanged?.Invoke("音声キャプチャを開始できませんでした。デバイスが他アプリで使用中の可能性があります。");
+            await processor.DisposeAsync();
+            _processor = null;
+            return;
+        }
+
         // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく
         if (_translationService != null)
         {
@@ -148,7 +189,16 @@ public class AudioPipeline
         {
             FullMode = BoundedChannelFullMode.DropOldest
         });
-        var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, cancellationToken);
+
+        // Whisperの文字起こし結果を翻訳ワーカーへ渡すための第2キュー。
+        // これによりWhisper自体は翻訳の完了を待たずに次のセグメントへ進める
+        // (翻訳が遅い/詰まっても、音声認識側の処理は止まらない)。
+        // 文字列のみを保持する軽量なキューなので上限は設けず、Whisper側のDropOldestで
+        // 全体の遅延蓄積を防ぐ設計に任せる。
+        var transcriptChannel = Channel.CreateUnbounded<string>();
+
+        var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer);
+        var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader);
 
         var readBuffer = new float[ChunkSamples];
         var speechBuffer = new List<float>();
@@ -173,7 +223,14 @@ public class AudioPipeline
                 }
 
                 float rms = ComputeRms(readBuffer, read);
-                bool isSpeechChunk = rms > EnergyThreshold;
+
+                // ヒステリシス: 発話中でない時は開始閾値(EnergyThreshold)、
+                // 発話中は継続閾値(EnergyThreshold×HysteresisRatio、より低い)で判定する。
+                // 同じ閾値を使い回すと、閾値ギリギリの音量が続く区間(息継ぎ等)で
+                // isSpeechChunkがtrue/falseを細かく往復し、無音カウントが0にリセットされたり
+                // 逆に短時間で無音判定が成立してセグメントが分断されたりしやすい。
+                float activeThreshold = inSpeech ? EnergyThreshold * HysteresisRatio : EnergyThreshold;
+                bool isSpeechChunk = rms > activeThreshold;
 
                 if (isSpeechChunk)
                 {
@@ -225,16 +282,38 @@ public class AudioPipeline
         {
             capture.StopRecording();
 
-            // キューへの書き込みを締め切り、溜まっている分の処理が終わるのを待ってから
-            // Whisperプロセッサを破棄する(処理中に破棄すると例外になるため)
+            // 停止した瞬間、まだ発話の途中(無音判定が確定する前)だった分がspeechBufferに
+            // 残っている可能性がある。短すぎなければ、これも最後の1区間として送っておく。
+            // ここで送らないと、話している最中に停止した最後の発話が丸ごと消える。
+            if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
+            {
+                segmentChannel.Writer.TryWrite(speechBuffer.ToArray());
+            }
+
+            // キューへの書き込みを締め切る。
+            // RunWhisperWorkerAsyncはCancellationToken.Noneで読んでいるため、ここでCompleteすれば
+            // 既にキューに積まれている(まだ処理していない)分もキャンセルされずに最後まで処理される。
             segmentChannel.Writer.Complete();
             try
             {
                 await whisperWorkerTask;
             }
-            catch
+            catch (Exception ex)
             {
-                // ワーカー内の例外はここでは無視する(処理自体は継続不要なため)
+                // ワーカー内の個別例外は既にRunWhisperWorkerAsync側でログ済みだが、
+                // ここに来る場合はワーカー自体の異常終了なので念のため記録する
+                Logger.Log("AudioPipeline.Whisper", "Whisperワーカーの終了待機中に例外が発生しました。", ex);
+            }
+
+            // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ
+            transcriptChannel.Writer.Complete();
+            try
+            {
+                await translationWorkerTask;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("AudioPipeline.Translation", "翻訳ワーカーの終了待機中に例外が発生しました。", ex);
             }
 
             await processor.DisposeAsync();
@@ -247,22 +326,60 @@ public class AudioPipeline
     /// <summary>
     /// キューに積まれた音声区間を1本ずつ順番に文字起こしする。
     /// Whisperの推論を同時に複数走らせないことで、CPU/GPUリソースの奪い合いを防ぐ。
+    /// 認識結果は翻訳を待たずtranscriptWriterへ渡すだけなので、翻訳が遅くてもここは詰まらない。
     /// </summary>
-    private async Task RunWhisperWorkerAsync(ChannelReader<float[]> reader, CancellationToken cancellationToken)
+    /// <remarks>
+    /// ReadAllAsyncには意図的にCancellationToken.Noneを渡している。
+    /// 呼び出し元(RunAsync)はキャンセル時、segmentChannel.Writer.Complete()を呼んだ後にこのタスクをawaitするが、
+    /// もしここで外側のcancellationTokenをそのまま渡すと、Complete()以前にキューへ積まれていた
+    /// 未処理のセグメントごと即座にOperationCanceledExceptionで捨てられてしまう。
+    /// Completeされたチャンネルはreader側で自然に列挙が終わるため、キャンセルトークンは不要。
+    /// </remarks>
+    private async Task RunWhisperWorkerAsync(ChannelReader<float[]> reader, ChannelWriter<string> transcriptWriter)
     {
-        await foreach (var segment in reader.ReadAllAsync(cancellationToken))
+        try
         {
-            try
+            await foreach (var segment in reader.ReadAllAsync(CancellationToken.None))
             {
-                await TranscribeSegmentAsync(segment);
+                try
+                {
+                    await TranscribeSegmentAsync(segment, transcriptWriter);
+                }
+                catch (Exception ex)
+                {
+                    // 1区間の失敗で全体を止めないよう処理は継続するが、原因調査ができるよう記録は残す
+                    Logger.Log("AudioPipeline.Whisper", "1区間の文字起こし処理で例外が発生しました。この区間はスキップします。", ex);
+                }
             }
-            catch (OperationCanceledException)
+        }
+        finally
+        {
+            transcriptWriter.TryComplete();
+        }
+    }
+
+    /// <summary>
+    /// Whisperが書き出した文字起こし結果を1件ずつ順番に翻訳する。
+    /// Whisperワーカーとは別タスクなので、翻訳API(DeepL/Ollama)が遅くても
+    /// 音声認識自体はブロックされない。
+    /// </summary>
+    private async Task RunTranslationWorkerAsync(ChannelReader<string> reader)
+    {
+        await foreach (var text in reader.ReadAllAsync(CancellationToken.None))
+        {
+            if (_translationService == null) continue;
+
+            var result = await _translationService.TranslateAsync(text);
+            if (result.Text != null)
             {
-                throw;
+                TranslatedTextReceived?.Invoke(result.Text);
             }
-            catch
+            else if (result.ErrorMessage != null)
             {
-                // 1区間の失敗で全体を止めないよう、ここでは無視して次に進む
+                // DeepL/Ollamaのエラーはこれまでコンソールに出すだけでUIに一切出ていなかった。
+                // WPFアプリとして配布した場合、通常ユーザーはコンソールを見ないため、
+                // 「なぜか訳文が出ない」状態のまま気づけなかった。ここでStatusへ通知する。
+                TranslationErrorOccurred?.Invoke(result.ErrorMessage);
             }
         }
     }
@@ -274,7 +391,7 @@ public class AudioPipeline
         return (float)Math.Sqrt(sumSquares / count);
     }
 
-    private async Task TranscribeSegmentAsync(float[] samples)
+    private async Task TranscribeSegmentAsync(float[] samples, ChannelWriter<string> transcriptWriter)
     {
         if (_processor == null) return;
 
@@ -318,17 +435,17 @@ public class AudioPipeline
 
             OriginalTextReceived?.Invoke(text);
 
-            if (_translationService != null)
-            {
-                var translated = await _translationService.TranslateAsync(text);
-                if (translated != null)
-                {
-                    TranslatedTextReceived?.Invoke(translated);
-                }
-            }
+            // 翻訳はここでawaitせず、キューに積んで別ワーカーに任せる。
+            // これにより次のセグメントのWhisper処理へすぐ進める。
+            transcriptWriter.TryWrite(text);
         }
     }
 }
+
+/// <summary>デバイス選択用の情報。OS上で一意なIDと表示名の両方を保持する。
+/// 名前の部分一致だけに頼ると、似た名前のデバイスが複数ある場合に誤選択しうるため、
+/// 可能な限りIDで一意に識別できるようにする。</summary>
+public record AudioDeviceInfo(string Id, string Name);
 
 /// <summary>
 /// WaveFileWriterがDispose時に内部のMemoryStreamまで閉じてしまわないようにするためのラッパー。

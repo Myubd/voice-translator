@@ -46,6 +46,24 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() => StatusText.Text = status);
         };
+
+        // DeepL/Ollamaの翻訳失敗は、これまでConsole.WriteLineのみでUIに一切出ていなかった。
+        // ステータス欄に出すことで、配布後のユーザーでも「翻訳が出ない理由」に気づけるようにする。
+        _pipeline.TranslationErrorOccurred += error =>
+        {
+            Dispatcher.Invoke(() => StatusText.Text = error);
+        };
+
+        Closing += MainWindow_Closing;
+    }
+
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // 録音・翻訳タスクが動いたままアプリを終了すると、バックグラウンドタスクが残り続けたり
+        // 未保存のオーバーレイ状態が残ったりする恐れがあるため、終了時に明示的に片付ける。
+        _cts?.Cancel();
+        _overlayWindow?.Close();
+        _httpClient.Dispose();
     }
 
     private async void StartStopButton_Click(object sender, RoutedEventArgs e)
@@ -64,6 +82,7 @@ public partial class MainWindow : Window
         _pipeline.EnergyThreshold = _settings.GameAudioPriorityMode
             ? _settings.VadThreshold * 1.5f
             : _settings.VadThreshold;
+        _pipeline.HysteresisRatio = _settings.VadHysteresisRatio;
         _pipeline.ConfigureTranslation(_settings.CreateTranslationService(_httpClient));
 
         _cts = new CancellationTokenSource();
@@ -72,7 +91,7 @@ public partial class MainWindow : Window
 
         try
         {
-            await _pipeline.RunAsync(_settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
+            await _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -80,6 +99,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            Logger.Log("MainWindow", "音声パイプラインの実行中に予期しない例外が発生しました。", ex);
             MessageBox.Show($"エラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
