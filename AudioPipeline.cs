@@ -16,7 +16,7 @@ using Whisper.net;
 /// 音声キャプチャ→VAD→文字起こし→翻訳、という一連の処理を担当するクラス。
 /// UI(WPF)には依存せず、結果はイベントで通知する。
 /// </summary>
-public class AudioPipeline
+public class AudioPipeline : IDisposable
 {
     // ==== VAD(発話区間検出)まわりのパラメータ ====
     const int SampleRate = 16000;
@@ -42,7 +42,16 @@ public class AudioPipeline
     // 溢れた場合は古いもの(=鮮度が落ちたもの)から捨てて最新の発話を優先する。
     const int TranscriptChannelCapacity = 8;
 
-    public float EnergyThreshold { get; set; } = 0.015f;
+    public float EnergyThreshold
+    {
+        get => _energyThreshold;
+        set
+        {
+            _energyThreshold = value;
+            if (_vad != null) _vad.EnergyThreshold = value;
+        }
+    }
+    private float _energyThreshold = 0.015f;
 
     /// <summary>
     /// ヒステリシス比率(0〜1)。発話「開始」の判定にはEnergyThresholdをそのまま使うが、
@@ -53,8 +62,21 @@ public class AudioPipeline
     /// 値を下げるほど、一度始まった発話は多少音量が下がっても継続扱いされやすくなる
     /// (=無音判定はより大きな音量低下があった時だけ働く)。
     /// 1.0にすると従来と同じ単一閾値の挙動になる。
+    ///
+    /// 実際の判定ロジック自体はVoiceActivitySegmenterに切り出されており、ここは
+    /// (RunAsync開始前を含め、いつ設定されても良いように)そのままVoiceActivitySegmenterへ
+    /// 委譲するプロパティになっている。
     /// </summary>
-    public float HysteresisRatio { get; set; } = 0.6f;
+    public float HysteresisRatio
+    {
+        get => _hysteresisRatio;
+        set
+        {
+            _hysteresisRatio = value;
+            if (_vad != null) _vad.HysteresisRatio = value;
+        }
+    }
+    private float _hysteresisRatio = 0.6f;
 
     /// <summary>原文を受信した際に発火する。Idと実際の発話時刻(StartTime/EndTime)を伴うため、
     /// 訳文側イベント(TranslatedTextReceived)と同じIdで対応付けられる。</summary>
@@ -83,6 +105,19 @@ public class AudioPipeline
     /// 音声セグメントの破棄(SegmentsDropped)とは別の段階(翻訳キュー)で発生する破棄なので分けて通知する。</summary>
     public event Action<int>? TranscriptsDropped;
 
+    /// <summary>WASAPI→BufferedWaveProviderの段階で、VAD側の読み出しが追いつかず生の音声データが
+    /// 破棄された際に通知される(破棄された累計バイト数を渡す)。SegmentsDropped/TranscriptsDroppedは
+    /// いずれも「一度セグメント化/文字起こしされた後」の破棄だが、ここで破棄されると
+    /// そもそも該当区間の音声がWhisperに一度も渡らないため、ユーザーからは
+    /// 「話したのに何も表示されない」としか見えない、最も気付きにくい種類の欠落となる。</summary>
+    public event Action<long>? AudioBufferOverflowOccurred;
+
+    /// <summary>翻訳待ちキューが満杯になり、文字起こし済みテキスト(TranscriptItem)が翻訳される前に
+    /// 破棄された際、その項目のIdを通知する。以前はTranscriptsDropped(件数)しか発火しないため、
+    /// UI側は原文受信時に先に出した「翻訳中…」のプレースホルダーをどのIdについて消せばよいか
+    /// 分からず、実際には翻訳されないまま「翻訳中…」が永遠に残ってしまっていた。</summary>
+    public event Action<long>? TranscriptItemSkipped;
+
     /// <summary>
     /// 1区間ぶんの遅延計測結果。「VAD開始 → Whisper完了 → 翻訳完了」の各段階にかかった時間と、
     /// 発話終了から翻訳完了までの累積遅延(=現在何秒遅れているか)を通知する。
@@ -100,23 +135,64 @@ public class AudioPipeline
     private readonly object _transcriptQueueLock = new object();
 
     // パイプライン開始からの経過時間を計測する基準時計。DateTime.Nowと違いシステム時刻変更の
-    // 影響を受けず、発話の実時間(SRTタイムスタンプ)と遅延計測の両方に使う。
+    // 影響を受けない。ただし、これはあくまで「処理を行っているスレッドの壁時計」であり、
+    // 発話の実際の音声時刻とは別物。Whisper処理が重くなってVADの読み出しが遅れた場合、
+    // _pipelineClock.Elapsedは「実際に音声が鳴った時刻」より遅れた値を返してしまう
+    // (=CPU負荷が低いときは正確だが、処理が遅延するほど不正確になる)。
+    // そのため、音声セグメントのタイムスタンプ(SRT等)には使わず、あくまで
+    // 「Whisper/翻訳の各段階にどれだけ壁時計時間がかかったか」を測る遅延計測にのみ使う。
     private readonly Stopwatch _pipelineClock = new Stopwatch();
+
+    // 実際に読み出した音声サンプル数(16kHzリサンプル後)の累計。これを基準に音声時刻を
+    // 算出することで、VAD処理側が遅延しても「音声内の何秒目か」というタイムスタンプ自体は
+    // ずれない(WASAPI/BufferedWaveProviderでの取りこぼし=overflowが発生しない限り、
+    // 音声時刻の算出根拠として_pipelineClock.Elapsedより正確)。
+    private long _audioSamplesRead = 0;
 
     private WhisperProcessor? _processor;
     private ITranslationService? _translationService;
 
+    // VAD(発話区間検出)のステートマシン本体。RunAsync開始時に生成し、終了時に破棄する。
+    // ロジック自体はVoiceActivitySegmenterクラスに切り出してあり、ここでは生成と
+    // EnergyThreshold/HysteresisRatioプロパティの委譲、および結果の受け取りのみを行う。
+    private VoiceActivitySegmenter? _vad;
+
+    // Silero VAD(ONNXニューラルモデル)による発話検出器。ONNXモデルのロード自体には
+    // ある程度コストがかかるため、RunAsyncのたびに作り直すのではなく、AudioPipelineの
+    // 生存期間を通じて1つだけ保持し、セッション開始のたびにReset()で内部状態だけ初期化する。
+    // ロードに失敗した場合(モデルファイルが見つからない等)はnullのままとし、
+    // VoiceActivitySegmenter側で自動的に従来のRMSベース判定にフォールバックする。
+    private SileroVadDetector? _sileroDetector;
+    private bool _sileroDetectorLoadAttempted = false;
+
     private readonly object _dedupLock = new object();
     private string? _lastGlobalText;
-    private DateTime _lastGlobalTime = DateTime.MinValue;
+    // 重複除去の基準時刻。以前はDateTime.Nowを使っていたため、システム時刻の変更(NTP補正・
+    // サマータイム・手動変更等)の影響を受ける可能性があった。_pipelineClock(Stopwatch)は
+    // OS起動からの単調増加時間を基準にしており、システム時刻の影響を受けないため
+    // こちらに統一する。nullは「まだ一度も記録していない」ことを表す
+    // (TimeSpan.MinValueだと、_pipelineClock.Elapsedとの差分計算でオーバーフローしうるため使わない)。
+    private TimeSpan? _lastGlobalTime = null;
 
     /// <summary>利用可能な出力(ループバック対象)デバイスの一覧を、OS上で一意なIDと表示名のペアで取得する</summary>
     public static List<AudioDeviceInfo> GetAvailableDevices()
     {
-        var enumerator = new MMDeviceEnumerator();
-        return enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-            .Select(d => new AudioDeviceInfo(d.ID, d.FriendlyName))
-            .ToList();
+        // MMDeviceEnumerator/MMDeviceはCOMラッパー(IDisposable)。設定画面を開くたびに
+        // このメソッドが呼ばれる想定のため、明示的にdisposeしないとCOMオブジェクトが
+        // 積み上がる可能性がある。列挙して得た各MMDeviceも使い終わったら解放する
+        // (MMDeviceCollection自体はIDisposableを実装していないためusing対象外)。
+        using var enumerator = new MMDeviceEnumerator();
+        var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
+        try
+        {
+            return devices
+                .Select(d => new AudioDeviceInfo(d.ID, d.FriendlyName))
+                .ToList();
+        }
+        finally
+        {
+            foreach (var d in devices) d.Dispose();
+        }
     }
 
     public void ConfigureTranslation(ITranslationService? service)
@@ -126,7 +202,7 @@ public class AudioPipeline
 
     public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, CancellationToken cancellationToken)
     {
-        var enumerator = new MMDeviceEnumerator();
+        using var enumerator = new MMDeviceEnumerator();
         var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
 
         // OS上で一意なDevice IDが保存されていればそれを最優先で使う(同名デバイスの誤選択を防ぐ)。
@@ -144,8 +220,17 @@ public class AudioPipeline
 
         if (target == null)
         {
+            // 選択候補が見つからなかった場合、列挙した全デバイスがここで不要になるため解放する
+            foreach (var d in devices) d.Dispose();
             StatusChanged?.Invoke($"'{deviceKeyword}' を含むデバイスが見つかりませんでした。設定画面でデバイスを選び直してください。");
             return;
+        }
+
+        // 選ばれなかった方のMMDeviceはこの後使わないため、ここで解放しておく
+        // (targetは録音中ずっと使うため、WasapiLoopbackCaptureの生存期間と合わせてここでは解放しない)
+        foreach (var d in devices)
+        {
+            if (!ReferenceEquals(d, target)) d.Dispose();
         }
 
         // exeがどのディレクトリから起動されても見つかるよう、相対パスは実行ファイルの場所を基準に解決する
@@ -157,6 +242,30 @@ public class AudioPipeline
         {
             StatusChanged?.Invoke($"モデルファイルが見つかりません: {resolvedModelPath}");
             return;
+        }
+
+        // Silero VAD(ONNXモデル)のロードは初回のみ試みる。csproj側でsilero_vad.onnxを
+        // 実行ファイルと同じフォルダにコピーする設定にしてあるため、通常はそのまま見つかるはずだが、
+        // 万一(配布物からファイルが欠落している等)見つからない/ロードに失敗した場合でも、
+        // アプリ自体は起動を諦めず、従来のRMSベースVADにフォールバックして動作を継続する。
+        if (!_sileroDetectorLoadAttempted)
+        {
+            _sileroDetectorLoadAttempted = true;
+            string sileroModelPath = Path.Combine(AppContext.BaseDirectory, "silero_vad.onnx");
+            try
+            {
+                _sileroDetector = new SileroVadDetector(sileroModelPath);
+                // 成功時もログに残しておく。「エラーが出ていない=Sileroが使われている」と
+                // 決め打ちせず、あとから確認できるようにするため
+                // (実際にどちらが使われているかはStatusText/ログの両方で確認可能にしている)
+                Logger.Log("AudioPipeline.SileroVad", $"Silero VADモデルをロードしました: {sileroModelPath}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("AudioPipeline.SileroVad",
+                    "Silero VADモデルのロードに失敗しました。従来のRMSベースVADで続行します。", ex);
+                _sileroDetector = null;
+            }
         }
 
         using var whisperFactory = WhisperFactory.FromPath(resolvedModelPath);
@@ -179,6 +288,12 @@ public class AudioPipeline
         // 単調増加させ続ける。
         _droppedSegmentCount = 0;
         _droppedTranscriptCount = 0;
+        _audioSamplesRead = 0;
+        // 前回セッションの重複除去状態を持ち越さない。_pipelineClockは下でRestart()されるため、
+        // 前回セッションの_lastGlobalTimeが残っていると「新セッション開始直後なのに、
+        // 経過時間の差分がたまたま3秒未満になり誤って重複と判定される」ことがありうる
+        _lastGlobalText = null;
+        _lastGlobalTime = null;
         // _pipelineClockは今回の実行(発話の実時間)を基準にリセットする。そのため、SRTエクスポート等の
         // タイムスタンプは「開始/停止を1回だけ行ったセッション」を前提とした相対時刻になる。
         // 履歴をクリアせずに複数回Start/Stopを繰り返した場合、2回目以降の実行分は
@@ -191,11 +306,16 @@ public class AudioPipeline
         try
         {
             using var capture = new WasapiLoopbackCapture(target);
+            // 以前は5秒分だったが、Whisper推論中(特に大きいモデル/低スペック環境)にVAD側の
+            // 読み出しがそれ以上遅れるケースがあり、その間の発話が丸ごと欠落しうるため
+            // 15秒分に拡大した。それでも溢れる場合は下のoverflow検出でユーザーに通知する。
+            const int bufferSeconds = 15;
             var bufferedProvider = new BufferedWaveProvider(capture.WaveFormat)
             {
-                BufferLength = capture.WaveFormat.AverageBytesPerSecond * 5,
+                BufferLength = capture.WaveFormat.AverageBytesPerSecond * bufferSeconds,
                 DiscardOnBufferOverflow = true
             };
+            long droppedAudioBytes = 0;
 
             ISampleProvider sampleProvider = bufferedProvider.ToSampleProvider();
             if (capture.WaveFormat.Channels == 2)
@@ -220,6 +340,19 @@ public class AudioPipeline
 
             capture.DataAvailable += (s, e) =>
             {
+                // BufferedWaveProvider.AddSamples自体はDiscardOnBufferOverflow=trueのとき
+                // 溢れた分を例外を投げずに黙って捨てるだけで、呼び出し側には何も知らせない。
+                // ここで事前にバッファの空き容量をチェックし、溢れる場合は破棄バイト数を
+                // 累計してイベント通知することで、「音声が消えたのに何も表示されない」状態を防ぐ。
+                int availableBytes = bufferedProvider.BufferLength - bufferedProvider.BufferedBytes;
+                if (e.BytesRecorded > availableBytes)
+                {
+                    long overflowBytes = e.BytesRecorded - availableBytes;
+                    droppedAudioBytes += overflowBytes;
+                    Logger.Log("AudioPipeline.Capture",
+                        $"Audio capture buffer overflow: {overflowBytes} bytes (累計 {droppedAudioBytes} bytes)");
+                    AudioBufferOverflowOccurred?.Invoke(droppedAudioBytes);
+                }
                 bufferedProvider.AddSamples(e.Buffer, 0, e.BytesRecorded);
             };
 
@@ -252,14 +385,29 @@ public class AudioPipeline
                 return;
             }
 
-            // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく
+            // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく。
+            // cancellationTokenを渡すことで、この処理中にユーザーが「停止」した場合も
+            // (以前のようにPrepareAsyncの完了/タイムアウトを待たされることなく)即座に打ち切れる。
             if (_translationService != null)
             {
                 StatusChanged?.Invoke("翻訳の準備中(用語集を抽出しています)...");
-                await _translationService.PrepareAsync();
+                try
+                {
+                    await _translationService.PrepareAsync(cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // 準備中にユーザーが停止した場合はそのまま抜け、外側のtry/finallyで後片付けする
+                    throw;
+                }
             }
 
-            StatusChanged?.Invoke($"認識中: {target.FriendlyName}");
+            // どちらのVADエンジンで動作しているかを毎回ステータス表示に含める。
+            // 成功時は無言、失敗時だけ警告、という以前の実装だと「エラーが出ていない=Sileroが
+            // 使われている」と決め打ちすることになり分かりにくいため、成功/失敗どちらの場合も
+            // ここで明示する。
+            string vadEngineLabel = _sileroDetector != null ? "Silero VAD" : "簡易VAD(RMS)";
+            StatusChanged?.Invoke($"認識中: {target.FriendlyName} / VAD: {vadEngineLabel}");
 
             // Whisper処理を1本のキューで順番に処理するためのチャンネル。
             // これにより、発話が連続しても複数のWhisper推論が同時実行されてリソースを
@@ -297,11 +445,35 @@ public class AudioPipeline
             var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader);
 
             var readBuffer = new float[ChunkSamples];
-            var speechBuffer = new List<float>();
-            var prerollBuffer = new Queue<float[]>();
-            int silenceChunkCount = 0;
-            bool inSpeech = false;
-            TimeSpan segmentStartTime = TimeSpan.Zero;
+            // VADの状態(発話中か、直近の無音チャンク数、プリロールバッファ等)は
+            // すべてVoiceActivitySegmenter側で保持する。ここではRunAsync開始時点の
+            // EnergyThreshold/HysteresisRatioと、(利用可能なら)Silero VAD検出器を渡して生成する。
+            _sileroDetector?.Reset();
+
+            // EnergyThreshold/HysteresisRatioはSilero VAD(確率0〜1)のスケールで保存・設定されている。
+            // 万一Silero VADのロードに失敗し、従来のRMSベース判定にフォールバックする場合、
+            // ユーザーが設定した値(例: 0.5)をそのままRMS閾値として使うと、RMSが0.5を超えることは
+            // 通常無いためVADが実質的に一切反応しなくなる「静かな機能不全」につながる。
+            // これを避けるため、フォールバック時は固定の安全なRMS閾値を使い、その旨をユーザーに通知する。
+            const float FallbackRmsThreshold = 0.015f;
+            float effectiveEnergyThreshold = EnergyThreshold;
+            if (_sileroDetector == null)
+            {
+                effectiveEnergyThreshold = FallbackRmsThreshold;
+                StatusChanged?.Invoke("Silero VADモデルが利用できないため、簡易(RMS)方式の発話検出で動作しています");
+            }
+
+            _vad = new VoiceActivitySegmenter(
+                SampleRate, ChunkSamples, SilenceChunksToEndSpeech, MinSpeechChunks,
+                MaxSpeechChunks, PrerollChunks, ForcedSplitOverlapChunks, _sileroDetector)
+            {
+                EnergyThreshold = effectiveEnergyThreshold,
+                HysteresisRatio = HysteresisRatio
+            };
+            // 直近に読み出した音声サンプルまでの「音声内時刻」。_pipelineClock.Elapsed(壁時計)とは
+            // 異なり、実際に何サンプル分の音声を読み終えたかだけに基づくため、VAD/Whisperの処理が
+            // 遅延してもこの値自体はずれない。
+            TimeSpan currentAudioTime = TimeSpan.Zero;
 
             try
             {
@@ -319,86 +491,16 @@ public class AudioPipeline
                         continue;
                     }
 
-                    float rms = ComputeRms(readBuffer, read);
+                    // このチャンクぶんを読み終えた時点での音声内時刻を更新する。
+                    // (audioSamplePosition / SampleRate、というGPTレビューの改善案に相当)
+                    _audioSamplesRead += read;
+                    currentAudioTime = TimeSpan.FromSeconds((double)_audioSamplesRead / SampleRate);
 
-                    // ヒステリシス: 発話中でない時は開始閾値(EnergyThreshold)、
-                    // 発話中は継続閾値(EnergyThreshold×HysteresisRatio、より低い)で判定する。
-                    // 同じ閾値を使い回すと、閾値ギリギリの音量が続く区間(息継ぎ等)で
-                    // isSpeechChunkがtrue/falseを細かく往復し、無音カウントが0にリセットされたり
-                    // 逆に短時間で無音判定が成立してセグメントが分断されたりしやすい。
-                    float activeThreshold = inSpeech ? EnergyThreshold * HysteresisRatio : EnergyThreshold;
-                    bool isSpeechChunk = rms > activeThreshold;
-
-                    if (isSpeechChunk)
+                    var vadResult = _vad.ProcessChunk(readBuffer, read, currentAudioTime);
+                    if (vadResult != null)
                     {
-                        if (!inSpeech)
-                        {
-                            inSpeech = true;
-                            speechBuffer.Clear();
-
-                            // 発話開始時刻は「今」ではなく、先頭に付与するプリロール分だけ
-                            // 遡った時刻になる(プリロールも実際にはその時刻に鳴っていた音声のため)
-                            long prerollSamples = prerollBuffer.Sum(c => (long)c.Length);
-                            segmentStartTime = _pipelineClock.Elapsed - TimeSpan.FromSeconds((double)prerollSamples / SampleRate);
-                            if (segmentStartTime < TimeSpan.Zero) segmentStartTime = TimeSpan.Zero;
-
-                            // 発話開始の瞬間、直前まで無音だと思って捨てていた分(プリロール)を
-                            // 先頭に付与することで、語頭の欠落を防ぐ
-                            foreach (var chunk in prerollBuffer)
-                            {
-                                speechBuffer.AddRange(chunk);
-                            }
-                        }
-                        speechBuffer.AddRange(readBuffer.Take(read));
-                        silenceChunkCount = 0;
-                    }
-                    else if (inSpeech)
-                    {
-                        speechBuffer.AddRange(readBuffer.Take(read));
-                        silenceChunkCount++;
-
-                        bool silenceLongEnough = silenceChunkCount >= SilenceChunksToEndSpeech;
-                        bool tooLong = speechBuffer.Count / ChunkSamples >= MaxSpeechChunks;
-
-                        if (silenceLongEnough)
-                        {
-                            // 無音による自然な発話終了。プリロールと同様、この後は非発話状態に戻る
-                            inSpeech = false;
-                            if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
-                            {
-                                var segment = BuildSegment(speechBuffer, segmentStartTime, _pipelineClock.Elapsed);
-                                WriteSegment(segmentChannel.Writer, segmentChannel.Reader, segment);
-                            }
-                            speechBuffer.Clear();
-                        }
-                        else if (tooLong)
-                        {
-                            // 15秒の強制分割。無音を検出したわけではなく、発話はまだ続いている可能性が高いため
-                            // inSpeechはtrueのまま維持し、直前の音声の末尾を少しだけ次のセグメントへ引き継ぐ。
-                            // これにより、分割位置をまたぐ文でWhisperが直前の文脈(語尾)を完全に失うのを防ぐ
-                            var splitEndTime = _pipelineClock.Elapsed;
-                            var segment = BuildSegment(speechBuffer, segmentStartTime, splitEndTime);
-                            WriteSegment(segmentChannel.Writer, segmentChannel.Reader, segment);
-
-                            int overlapSamples = Math.Min(ForcedSplitOverlapChunks * ChunkSamples, speechBuffer.Count);
-                            var carryOver = speechBuffer.GetRange(speechBuffer.Count - overlapSamples, overlapSamples);
-                            speechBuffer.Clear();
-                            speechBuffer.AddRange(carryOver);
-                            silenceChunkCount = 0;
-
-                            // 次のセグメントの開始時刻は、引き継いだ分だけ現在より少し前になる
-                            segmentStartTime = splitEndTime - TimeSpan.FromSeconds((double)overlapSamples / SampleRate);
-                        }
-                    }
-
-                    // 発話中でない間も、直近のチャンクを常にプリロール用バッファに保持しておく
-                    if (!inSpeech)
-                    {
-                        prerollBuffer.Enqueue(readBuffer.Take(read).ToArray());
-                        while (prerollBuffer.Count > PrerollChunks)
-                        {
-                            prerollBuffer.Dequeue();
-                        }
+                        var segment = BuildSegment(vadResult.Samples, vadResult.StartTime, vadResult.EndTime);
+                        WriteSegment(segmentChannel.Writer, segmentChannel.Reader, segment);
                     }
                 }
             }
@@ -406,12 +508,14 @@ public class AudioPipeline
             {
                 capture.StopRecording();
 
-                // 停止した瞬間、まだ発話の途中(無音判定が確定する前)だった分がspeechBufferに
-                // 残っている可能性がある。短すぎなければ、これも最後の1区間として送っておく。
+                // 停止した瞬間、まだ発話の途中(無音判定が確定する前)だった分が
+                // VoiceActivitySegmenter内に残っている可能性がある。短すぎなければ、
+                // これも最後の1区間として送っておく。
                 // ここで送らないと、話している最中に停止した最後の発話が丸ごと消える。
-                if (speechBuffer.Count / ChunkSamples >= MinSpeechChunks)
+                var finalSegment = _vad.Flush(currentAudioTime);
+                if (finalSegment != null)
                 {
-                    var segment = BuildSegment(speechBuffer, segmentStartTime, _pipelineClock.Elapsed);
+                    var segment = BuildSegment(finalSegment.Samples, finalSegment.StartTime, finalSegment.EndTime);
                     WriteSegment(segmentChannel.Writer, segmentChannel.Reader, segment);
                 }
 
@@ -430,8 +534,15 @@ public class AudioPipeline
                     Logger.Log("AudioPipeline.Whisper", "Whisperワーカーの終了待機中に例外が発生しました。", ex);
                 }
 
-                // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ
-                transcriptChannel.Writer.Complete();
+                // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ。
+                // TryComplete()を使う(Complete()は使わない)理由: RunWhisperWorkerAsync側のfinally節が
+                // 既にtranscriptWriter.TryComplete()を呼んでいるため、ここでも呼ばれた時点で
+                // このキューは既に完了済みになっている。Complete()は「既に完了済みの場合は
+                // ChannelClosedExceptionを投げる」仕様のため、録音を停止するたびに必ずこの例外が
+                // 発生し、ユーザーに「The channel has been closed.」というエラーダイアログが
+                // 出てしまっていた。TryComplete()は既に完了済みでも例外を投げず単にfalseを返すだけなので、
+                // ここでは意図(=念のためもう一度締め切りを試みる)を安全に表現できる。
+                transcriptChannel.Writer.TryComplete();
                 try
                 {
                     await translationWorkerTask;
@@ -442,6 +553,7 @@ public class AudioPipeline
                 }
 
                 await DisposeProcessorAsync();
+                _vad = null;
 
                 StatusChanged?.Invoke("停止しました");
             }
@@ -497,11 +609,41 @@ public class AudioPipeline
     {
         try
         {
-            await foreach (var segment in reader.ReadAllAsync(CancellationToken.None))
+            while (true)
             {
+                // 以前は reader.ReadAllAsync() でロックの外から直接消費していたため、
+                // WriteSegment側の「Count確認→TryRead(捨てる)→TryWrite」という一連の操作と
+                // このスレッドのTryReadが競合し、「実際には満杯でなかったのに1件dropする」
+                // (逆に、dropすべきなのにカウントし損ねる)可能性があった。
+                // TryRead自体を_segmentQueueLockの下で行うことで、WriteSegment側のdrop判定と
+                // 完全に排他させ、drop数を正確に計測できるようにする。
+                // (ロックを保持するのはTryReadの一瞬だけで、データが無い間の待機は
+                // WaitToReadAsyncでロック外で行うため、producer側の書き込みを妨げない)
+                SpeechSegment? segment;
+                bool got;
+                lock (_segmentQueueLock)
+                {
+                    got = reader.TryRead(out segment);
+                }
+
+                if (!got)
+                {
+                    bool more;
+                    try
+                    {
+                        more = await reader.WaitToReadAsync(CancellationToken.None);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                    if (!more) break; // Writer.Complete()済みでキューも空 → 終了
+                    continue;
+                }
+
                 try
                 {
-                    await TranscribeSegmentAsync(segment, transcriptWriter, transcriptReader);
+                    await TranscribeSegmentAsync(segment!, transcriptWriter, transcriptReader);
                 }
                 catch (Exception ex)
                 {
@@ -523,11 +665,36 @@ public class AudioPipeline
     /// </summary>
     private async Task RunTranslationWorkerAsync(ChannelReader<TranscriptItem> reader)
     {
-        await foreach (var item in reader.ReadAllAsync(CancellationToken.None))
+        while (true)
         {
+            // WriteTranscriptItem側のdrop判定と同じ_transcriptQueueLockの下でTryReadすることで、
+            // producer(WriteTranscriptItem)とconsumer(このワーカー)間の競合を無くし、
+            // drop数を正確に計測できるようにする(WriteSegment/RunWhisperWorkerAsyncと同じ設計)。
+            TranscriptItem? item;
+            bool got;
+            lock (_transcriptQueueLock)
+            {
+                got = reader.TryRead(out item);
+            }
+
+            if (!got)
+            {
+                bool more;
+                try
+                {
+                    more = await reader.WaitToReadAsync(CancellationToken.None);
+                }
+                catch
+                {
+                    break;
+                }
+                if (!more) break;
+                continue;
+            }
+
             if (_translationService == null) continue;
 
-            var result = await _translationService.TranslateAsync(item.Text);
+            var result = await _translationService.TranslateAsync(item!.Text);
             var translationCompletedAt = _pipelineClock.Elapsed;
 
             if (result.Text != null)
@@ -563,34 +730,12 @@ public class AudioPipeline
     }
 
     /// <summary>
-    /// マイク/オーディオデバイス固有の直流成分(DCオフセット)を取り除いてからRMSを計算する。
-    /// DCオフセットが乗っていると、無音のはずの区間でもRMSが下がりきらず、VADが
-    /// 「ずっと発話中」と誤判定し続けることがあるため、平均値を差し引いてから実効値を求める。
-    /// (VAD判定にのみ使用し、Whisperに渡す音声データ自体は元のサンプルのまま加工しない)
-    /// </summary>
-    private static float ComputeRms(float[] buffer, int count)
-    {
-        double sum = 0;
-        for (int i = 0; i < count; i++) sum += buffer[i];
-        double mean = sum / count;
-
-        double sumSquares = 0;
-        for (int i = 0; i < count; i++)
-        {
-            double centered = buffer[i] - mean;
-            sumSquares += centered * centered;
-        }
-        return (float)Math.Sqrt(sumSquares / count);
-    }
-
-    /// <summary>
     /// 音声セグメントをキューへ書き込む。
-    /// 以前はBoundedChannelFullMode.DropOldestに任せた上で、書き込み前のreader.Countを見て
-    /// 破棄の発生を推測していたが、この「チェック」と「書き込み」の間に別スレッド(Whisperワーカー)が
-    /// 1件消費すると、実際には破棄が起きていないのに破棄したとカウントする(逆に、起きたのに
-    /// カウントし損ねる)競合が理論上あり得た。ここでは書き込みも含めて全体をロックし、
-    /// 満杯なら明示的に自分で1件読み捨ててから書き込む、という一連の操作をアトミックに行うことで
-    /// drop数を正確に計測する。
+    /// 満杯なら古い方から明示的に読み捨ててから書き込む、という一連の操作をロックでアトミックに行う。
+    /// 以前はこのロックを消費側(Whisperワーカー)のTryReadが取得していなかったため、
+    /// 「チェック」と「書き込み」の間に消費側が1件読んでしまい、実際には満杯でなかったのに
+    /// 1件dropしたと誤カウントする競合が理論上あり得た。RunWhisperWorkerAsync側のTryReadも
+    /// 同じ_segmentQueueLockの下で行うようにしたことで、この競合は解消されている。
     /// </summary>
     private void WriteSegment(ChannelWriter<SpeechSegment> writer, ChannelReader<SpeechSegment> reader, SpeechSegment segment)
     {
@@ -614,22 +759,28 @@ public class AudioPipeline
     /// <summary>
     /// 文字起こし結果(翻訳待ち)をキューへ書き込む。WriteSegmentと同じ理由で、
     /// 満杯時の読み捨て+書き込みをロックでアトミックに行い、正確なdrop数を計測する。
+    /// 読み捨てた項目のIdはTranscriptItemSkippedで個別に通知し、UI側が該当行の
+    /// 「翻訳中…」プレースホルダーを解消できるようにする。
     /// </summary>
     private void WriteTranscriptItem(ChannelWriter<TranscriptItem> writer, ChannelReader<TranscriptItem> reader, TranscriptItem item)
     {
-        bool dropped = false;
+        var skippedIds = new List<long>();
         lock (_transcriptQueueLock)
         {
-            while (reader.Count >= TranscriptChannelCapacity && reader.TryRead(out _))
+            while (reader.Count >= TranscriptChannelCapacity && reader.TryRead(out var evicted))
             {
                 _droppedTranscriptCount++;
-                dropped = true;
+                skippedIds.Add(evicted.Id);
             }
             writer.TryWrite(item);
         }
-        if (dropped)
+        if (skippedIds.Count > 0)
         {
             TranscriptsDropped?.Invoke(_droppedTranscriptCount);
+            foreach (var skippedId in skippedIds)
+            {
+                TranscriptItemSkipped?.Invoke(skippedId);
+            }
             Logger.LogMetric("Queue", ("queue", "transcript"), ("capacity", TranscriptChannelCapacity), ("dropped_total", _droppedTranscriptCount));
         }
     }
@@ -638,18 +789,13 @@ public class AudioPipeline
     {
         if (_processor == null) return;
 
-        using var ms = new MemoryStream();
-        using (var writer = new WaveFileWriter(new IgnoreDisposeStream(ms), new WaveFormat(SampleRate, 1)))
-        {
-            foreach (var sample in segment.Samples)
-            {
-                writer.WriteSample(sample);
-            }
-        }
-        ms.Position = 0;
-
+        // 以前はWhisperへ渡すためだけにMemoryStream上へWAVヘッダ付きで書き出していたが、
+        // Whisper.netのProcessAsyncは float[] samples を直接受け付けるオーバーロードを持っており、
+        // 単一チャンネル・16kHzで既に保持しているsegment.Samplesをそのまま渡せる。
+        // WAVラッピング(MemoryStream確保+WaveFileWriterでのサンプルごとの書き込み)は
+        // 発話のたびに発生する不要なコピー/メモリ割り当てだったため省略する。
         string? lastText = null;
-        await foreach (var result in _processor.ProcessAsync(ms))
+        await foreach (var result in _processor.ProcessAsync(segment.Samples))
         {
             var text = result.Text?.Trim();
             if (string.IsNullOrWhiteSpace(text)) continue;
@@ -674,11 +820,12 @@ public class AudioPipeline
                 // 窓を3秒に短縮している(過去のバグ修正の経緯であり、部分一致方式への変更は
                 // 無関係な文同士がたまたま一部重なって誤除去されるリスクとのトレードオフになるため、
                 // 現状の完全一致方式を維持する)
-                isDuplicate = text == _lastGlobalText && (DateTime.Now - _lastGlobalTime) < TimeSpan.FromSeconds(3);
+                isDuplicate = text == _lastGlobalText && _lastGlobalTime.HasValue
+                    && (_pipelineClock.Elapsed - _lastGlobalTime.Value) < TimeSpan.FromSeconds(3);
                 if (!isDuplicate)
                 {
                     _lastGlobalText = text;
-                    _lastGlobalTime = DateTime.Now;
+                    _lastGlobalTime = _pipelineClock.Elapsed;
                 }
             }
             if (isDuplicate) continue;
@@ -704,6 +851,17 @@ public class AudioPipeline
             };
             WriteTranscriptItem(transcriptWriter, transcriptReader, transcriptItem);
         }
+    }
+
+    /// <summary>
+    /// Silero VADのONNXセッション(ネイティブリソース)を解放する。RunAsync自体は
+    /// 開始/停止を何度でも繰り返せる設計だが、このDisposeはアプリ終了時に1回だけ呼ぶ想定。
+    /// (RunAsyncの実行中に呼んではいけない。呼んだ場合、以降のVAD推論が失敗する)
+    /// </summary>
+    public void Dispose()
+    {
+        _sileroDetector?.Dispose();
+        _sileroDetector = null;
     }
 }
 
@@ -756,30 +914,5 @@ class MultiChannelToMonoSampleProvider : ISampleProvider
         }
 
         return framesRead;
-    }
-}
-
-/// <summary>
-/// WaveFileWriterがDispose時に内部のMemoryStreamまで閉じてしまわないようにするためのラッパー。
-/// </summary>
-class IgnoreDisposeStream : Stream
-{
-    private readonly Stream _inner;
-    public IgnoreDisposeStream(Stream inner) => _inner = inner;
-
-    public override bool CanRead => _inner.CanRead;
-    public override bool CanSeek => _inner.CanSeek;
-    public override bool CanWrite => _inner.CanWrite;
-    public override long Length => _inner.Length;
-    public override long Position { get => _inner.Position; set => _inner.Position = value; }
-    public override void Flush() => _inner.Flush();
-    public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
-    public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
-    public override void SetLength(long value) => _inner.SetLength(value);
-    public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
-
-    protected override void Dispose(bool disposing)
-    {
-        // 内部のMemoryStreamは意図的に閉じない
     }
 }

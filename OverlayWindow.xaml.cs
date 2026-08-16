@@ -17,6 +17,12 @@ public partial class OverlayWindow : Window
     /// <summary>文字サイズ・背景の不透明度・最大表示行数を設定に合わせて適用する</summary>
     public void ApplyAppearance(double fontSize, double opacity, int maxLines)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(() => ApplyAppearance(fontSize, opacity, maxLines));
+            return;
+        }
+
         TranslatedListBox.Tag = fontSize;
         _maxLines = System.Math.Max(1, maxLines);
 
@@ -26,9 +32,19 @@ public partial class OverlayWindow : Window
         TrimAndRefreshEmphasis();
     }
 
-    /// <summary>訳文を1行追加する。呼び出し元でDispatcher経由にすること</summary>
+    /// <summary>訳文を1行追加する。
+    /// UI要素(TranslatedListBox)を直接操作するため、必ずUIスレッドから呼ぶ必要がある。
+    /// 以前はこの制約がコメントのみで、呼び出し元の規律に依存していたため見えにくかった。
+    /// Dispatcher.CheckAccess()で明示的にチェックし、UIスレッド以外から呼ばれた場合は
+    /// 自動的にUIスレッドへ委譲することで、呼び出し側のミスによるクラッシュを防ぐ。</summary>
     public void AddTranslatedLine(string text)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(() => AddTranslatedLine(text));
+            return;
+        }
+
         TranslatedListBox.Items.Add(text);
         TrimAndRefreshEmphasis();
 
@@ -62,6 +78,12 @@ public partial class OverlayWindow : Window
     /// <summary>表示している訳文をすべてクリアする</summary>
     public void ClearLines()
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(ClearLines);
+            return;
+        }
+
         TranslatedListBox.Items.Clear();
     }
 

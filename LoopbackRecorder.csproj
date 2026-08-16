@@ -13,6 +13,32 @@
     <PackageReference Include="Whisper.net" Version="1.7.4" />
     <PackageReference Include="Whisper.net.Runtime" Version="1.7.4" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <!-- Silero VAD(発話区間検出)用。CPU版で十分軽量(1チャンク1ms未満)なため、
+         GPU版(Microsoft.ML.OnnxRuntime.Gpu)は使わずCPU版のみ導入する -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.29.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Silero VADのONNXモデル本体(約2.7MB)。Whisperモデル(数百MB〜)と違い小さいため、
+         ユーザーに別途ダウンロードさせず実行ファイルと一緒に配布する想定。
+         Condition="Exists(...)"を付けているのは、万一このファイルがプロジェクトフォルダに
+         配置されていない場合でも(RMSベースVADへの自動フォールバックがあるため)
+         ビルド自体は失敗させず、実行時にエラーメッセージで気付けるようにするため。 -->
+    <None Include="silero_vad.onnx" Condition="Exists('silero_vad.onnx')" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- Whisperモデル本体(ggml-base.bin等)。サイズが大きく(baseで約150MB)、かつ
+         ユーザーが好きなモデル(tiny/base/small/medium等)を選べるようにするため
+         リポジトリには含めず、プロジェクトフォルダに手動配置する運用にしている。
+         ここに置いておけば、Whisperモデルも(Silero VADモデルと同様に)ビルド時に
+         自動で出力フォルダへコピーされるようになる。
+         Condition="Exists(...)"を付けているのは、まだモデルファイルを配置していない
+         段階でも(初回セットアップ時等)ビルド自体は通せるようにするため。
+         (実行時にモデルが無い場合は、アプリ側で「モデルが見つかりません」という
+         分かりやすいダイアログを表示する) -->
+    <None Include="ggml-base.bin" Condition="Exists('ggml-base.bin')" CopyToOutputDirectory="PreserveNewest" />
+    <!-- tiny/small/medium等、base以外のモデルを使う場合は、同様に以下のような行を追加すればよい:
+    <None Include="ggml-small.bin" Condition="Exists('ggml-small.bin')" CopyToOutputDirectory="PreserveNewest" />
+    -->
   </ItemGroup>
 
 </Project>

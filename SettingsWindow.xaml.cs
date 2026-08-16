@@ -16,10 +16,13 @@ public partial class SettingsWindow : Window
 {
     public AppSettings Settings { get; private set; }
 
-    // MainWindow側とは別に、この設定画面専用のHttpClientを持つ(Ollamaのモデル一覧取得用)。
-    // 設定画面を開閉するたびに新しいHttpClientを作っていた従来の実装ではリソースが積み上がるため、
-    // インスタンスを1つだけ保持し、ウィンドウが閉じるタイミングで確実にDisposeする
-    private readonly HttpClient _httpClient = new HttpClient();
+    // 以前はこのウィンドウ専用にHttpClientを新規作成していたが、SettingsWindow自体が
+    // 設定画面を開くたびに(MainWindow側から)new SettingsWindow(...)で再生成されるため、
+    // 結果的に開閉のたびにHttpClientも新規作成されていた(ソケット枯渇・
+    // PooledConnectionLifetime未設定によるDNS変更未追従の原因になりうる)。
+    // MainWindow側で1つだけ保持している共有HttpClient(SocketsHttpHandler設定済み)を
+    // コンストラクタで受け取って使い回すことで、アプリ全体でHttpClientを1つに統一する。
+    private readonly HttpClient _httpClient;
 
     // Ollamaのモデル一覧取得は、Ollama自体が応答しない場合に長時間ぶら下がる可能性がある。
     // 設定画面を閉じたのにリクエストだけ裏で残り続けないよう、Closingでキャンセルできるようにする
@@ -36,10 +39,11 @@ public partial class SettingsWindow : Window
     private ModifierKeys _overlayModifiers;
     private Key _overlayKey;
 
-    public SettingsWindow(AppSettings currentSettings)
+    public SettingsWindow(AppSettings currentSettings, HttpClient sharedHttpClient)
     {
         InitializeComponent();
         Settings = currentSettings;
+        _httpClient = sharedHttpClient;
 
         // デバイス一覧を読み込む。保存済みのDeviceId(一意なOS識別子)があればそれを優先して選択し、
         // 無ければ従来どおり名前の部分一致にフォールバックする(同名デバイスが複数ある場合の誤選択を避けるため)
@@ -117,11 +121,11 @@ public partial class SettingsWindow : Window
 
     private void SettingsWindow_Closed(object? sender, EventArgs e)
     {
-        // 設定画面を閉じた後もOllamaへのリクエストが裏で残り続けないようキャンセルし、
-        // このウィンドウ専用のHttpClientも解放する
+        // 設定画面を閉じた後もOllamaへのリクエストが裏で残り続けないようキャンセルする。
+        // HttpClient自体はMainWindow側でアプリ全体を通じて共有されているため、ここではDisposeしない
+        // (Disposeすると、次に設定画面を開いたときや録音中のMainWindow側の通信まで壊れてしまう)。
         _ollamaLoadCts?.Cancel();
         _ollamaLoadCts?.Dispose();
-        _httpClient.Dispose();
     }
 
     /// <summary>Ollamaにインストール済みのモデル一覧を取得し、ドロップダウンに反映する</summary>

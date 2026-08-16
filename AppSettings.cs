@@ -24,7 +24,12 @@ public class AppSettings
     public string OllamaModel { get; set; } = "llama3.1";
     public string OllamaEndpoint { get; set; } = "http://localhost:11434";
     public string WhisperModelPath { get; set; } = "ggml-base.bin";
-    public float VadThreshold { get; set; } = 0.015f;
+
+    /// <summary>VAD(発話区間検出)の開始判定閾値。Silero VAD(ONNXニューラルモデル)を
+    /// 使う場合は発話確率(0〜1、大きいほど「発話らしい」と判定されにくくなる)のスケール。
+    /// (Silero VAD導入前はRMS実効値のスケール(概ね0.001〜0.05)だった。
+    /// 0.5という値は新スケールでの標準的な閾値であり、Silero VAD公式サンプルの既定値でもある)</summary>
+    public float VadThreshold { get; set; } = 0.5f;
 
     /// <summary>VADヒステリシス比率(0〜1)。発話継続中の「まだ話している」判定閾値を
     /// 開始閾値(VadThreshold)からどれだけ下げるか。小さいほど息継ぎ等での分断が起きにくくなる。</summary>
@@ -111,17 +116,30 @@ public class AppSettings
             : Environment.GetEnvironmentVariable("DEEPL_API_KEY") ?? "";
 
         // .envのような設定ファイルはOSのカルチャ(小数点がカンマになる地域設定等)に
-        // 影響されると壊れるため、数値の読み書きは必ずInvariantCultureで行う
+        // 影響されると壊れるため、数値の読み書きは必ずInvariantCultureで行う。
+        // また、設定画面はUI(Slider)の範囲内でしか保存できないが、.envファイルは
+        // ユーザーが直接編集できてしまうため、範囲外の値が入っていた場合は
+        // UI(Slider)の範囲にclampする。clampせず異常値を使い続けると、
+        // 例えばVAD_HYSTERESIS_RATIOに999のような値が入っている場合、常に無音判定
+        // されなくなって発話が延々と1つのセグメントとして扱われ続ける、といった
+        // 気付きにくい不具合につながる。
         var vadThresholdStr = Environment.GetEnvironmentVariable("VAD_THRESHOLD");
         if (float.TryParse(vadThresholdStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vadThreshold))
         {
-            settings.VadThreshold = vadThreshold;
+            // Silero VAD導入前の.envには、旧スケール(RMS実効値、概ね0.001〜0.05)の値が
+            // 残っている可能性がある。新スケール(Silero発話確率、0〜1)の最小値である0.05以下は
+            // ほぼ確実に旧スケールの値だと判断できるため、そのままclampするのではなく、
+            // 新スケールの既定値にリセットする(0.05にclampしてしまうと「ほぼ何でも発話と
+            // 判定してしまう極端に低い確率閾値」になり、実用にならないため)。
+            settings.VadThreshold = vadThreshold <= 0.06f
+                ? 0.5f
+                : Math.Clamp(vadThreshold, 0.05f, 0.95f);
         }
 
         var vadHysteresisStr = Environment.GetEnvironmentVariable("VAD_HYSTERESIS_RATIO");
         if (float.TryParse(vadHysteresisStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var vadHysteresisRatio))
         {
-            settings.VadHysteresisRatio = vadHysteresisRatio;
+            settings.VadHysteresisRatio = Math.Clamp(vadHysteresisRatio, 0.2f, 1.0f);
         }
 
         if (bool.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE"), out var priorityMode))
@@ -131,21 +149,21 @@ public class AppSettings
         if (float.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER"),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var priorityMultiplier))
         {
-            settings.GameAudioPriorityMultiplier = priorityMultiplier;
+            settings.GameAudioPriorityMultiplier = Math.Clamp(priorityMultiplier, 1.0f, 3.0f);
         }
         if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_FONT_SIZE"),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var fontSize))
         {
-            settings.OverlayFontSize = fontSize;
+            settings.OverlayFontSize = Math.Clamp(fontSize, 14, 48);
         }
         if (double.TryParse(Environment.GetEnvironmentVariable("OVERLAY_OPACITY"),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity))
         {
-            settings.OverlayOpacity = opacity;
+            settings.OverlayOpacity = Math.Clamp(opacity, 0, 1);
         }
         if (int.TryParse(Environment.GetEnvironmentVariable("OVERLAY_MAX_LINES"), out var maxLines))
         {
-            settings.OverlayMaxLines = maxLines;
+            settings.OverlayMaxLines = Math.Clamp(maxLines, 1, 10);
         }
         settings.WhisperPrompt = Environment.GetEnvironmentVariable("WHISPER_PROMPT") ?? "";
         settings.RecognitionLanguage = Environment.GetEnvironmentVariable("RECOGNITION_LANGUAGE") ?? "auto";
@@ -190,23 +208,37 @@ public class AppSettings
     /// .envファイルに書き込める形(Base64文字列)にする。
     /// 非Windows環境(開発機など)ではDPAPIが使えないため、平文のまま返す。
     /// </summary>
-    private static string EncryptDeepLApiKey(string plainText)
+    /// <summary>
+    /// 暗号化結果。IsEncrypted=falseの場合、Valueは平文であり、DEEPL_API_KEY_ENC(暗号化専用キー)
+    /// ではなく旧形式のDEEPL_API_KEY(平文キー)として保存すべきことを表す。
+    ///
+    /// 以前はこの区別が無く、暗号化に失敗しても常にDEEPL_API_KEY_ENCとして保存していたため、
+    /// 次回起動時にDecryptDeepLApiKey()が平文をBase64として復号しようとして必ず失敗し、
+    /// 結果的にAPIキーが空になって消えてしまうバグがあった。
+    /// </summary>
+    private readonly record struct EncryptResult(string Value, bool IsEncrypted);
+
+    private static EncryptResult EncryptDeepLApiKey(string plainText)
     {
-        if (string.IsNullOrEmpty(plainText)) return "";
-        if (!OperatingSystem.IsWindows()) return plainText;
+        if (string.IsNullOrEmpty(plainText)) return new EncryptResult("", true);
+        if (!OperatingSystem.IsWindows()) return new EncryptResult(plainText, false);
 
         try
         {
             var bytes = Encoding.UTF8.GetBytes(plainText);
             var protectedBytes = ProtectedData.Protect(bytes, DeepLKeyEntropy, DataProtectionScope.CurrentUser);
-            return Convert.ToBase64String(protectedBytes);
+            return new EncryptResult(Convert.ToBase64String(protectedBytes), true);
         }
         catch (Exception ex)
         {
             // 暗号化に失敗した場合でも設定の保存自体は止めたくないため、平文でフォールバックする。
-            // (この場合でも次回起動時にDEEPL_API_KEY_ENCとして読み込まれ、再暗号化が試みられる)
+            // ただしIsEncrypted=falseを返すことで、呼び出し側(SaveToEnv)が
+            // DEEPL_API_KEY_ENCではなく旧形式のDEEPL_API_KEYとして保存するようにする
+            // (LoadFromEnv側は元々DEEPL_API_KEY_ENC不在時にDEEPL_API_KEYへフォールバックする
+            // 実装になっているため、次回起動時も正しく読み込め、再度SaveToEnvされれば
+            // 改めて暗号化が試みられる)。
             Logger.Log("AppSettings", "DeepL APIキーの暗号化に失敗しました。平文で保存します。", ex);
-            return plainText;
+            return new EncryptResult(plainText, false);
         }
     }
 
@@ -240,7 +272,12 @@ public class AppSettings
         var escapedContext = OllamaContext.Replace("\r\n", "\n").Replace("\n", "\\n");
         var escapedPrompt = WhisperPrompt.Replace("\r\n", "\n").Replace("\n", "\\n");
         OllamaEndpoint = NormalizeEndpoint(OllamaEndpoint);
-        var encryptedApiKey = EncryptDeepLApiKey(DeepLApiKey);
+        var encryptResult = EncryptDeepLApiKey(DeepLApiKey);
+        // 暗号化に成功した場合のみDEEPL_API_KEY_ENC(暗号化専用キー)に書く。
+        // 失敗時はDEEPL_API_KEY(平文の旧形式キー)に書くことで、次回起動時に
+        // Base64として誤って復号を試みて失敗し、APIキーが消えてしまう事態を防ぐ。
+        var deepLApiKeyEncLine = encryptResult.IsEncrypted ? $"DEEPL_API_KEY_ENC={encryptResult.Value}" : "DEEPL_API_KEY_ENC=";
+        var deepLApiKeyPlainLine = encryptResult.IsEncrypted ? "DEEPL_API_KEY=" : $"DEEPL_API_KEY={encryptResult.Value}";
 
         var lines = new List<string>
         {
@@ -250,7 +287,7 @@ public class AppSettings
             "# 音声デバイスの一意なID。設定画面でデバイスを選択すると自動的に保存される(手動編集非推奨)",
             $"DEVICE_ID={DeviceId}",
             "",
-            "# VAD(発話検出)の閾値",
+            "# VAD(発話検出)の閾値。Silero VAD使用時は発話確率(0.05〜0.95)のスケール",
             $"VAD_THRESHOLD={VadThreshold.ToString(CultureInfo.InvariantCulture)}",
             "",
             "# VADヒステリシス比率(0〜1)。発話継続中の判定閾値をVAD_THRESHOLDからどれだけ下げるか。",
@@ -286,7 +323,9 @@ public class AppSettings
             "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)。",
             "# Windows DPAPIで暗号化して保存しているため、このファイルを他PC/他ユーザーへ",
             "# コピーしても復号できない(このPC・このWindowsユーザーでのみ有効)。",
-            $"DEEPL_API_KEY_ENC={encryptedApiKey}",
+            "# (万一DPAPIでの暗号化自体に失敗した場合は、下のDEEPL_API_KEYに平文で保存される)",
+            deepLApiKeyEncLine,
+            deepLApiKeyPlainLine,
             "",
             "# Ollama(ローカルAI)を使う場合に使用するモデル名",
             $"OLLAMA_MODEL={OllamaModel}",
@@ -305,9 +344,12 @@ public class AppSettings
         };
 
         // APIキーを含む設定ファイルなので、書き込み途中のクラッシュ/電源断で内容が
-        // 中途半端になるのを避けるため、一時ファイルに書いてから置き換える(アトミック寄りの保存)
+        // 中途半端になるのを避けるため、一時ファイルに書いてから置き換える(アトミック寄りの保存)。
+        // Encoding.UTF8は既定でBOM付きになるため、明示的にBOM無しUTF-8を指定する
+        // (このアプリはWindows専用でありBOM有無で読み込みに支障は無いが、他ツールで
+        // .envを直接編集/diffする際にBOMが混入していると扱いにくいため)
         var tempPath = EnvPath + ".tmp";
-        File.WriteAllLines(tempPath, lines, Encoding.UTF8);
+        File.WriteAllLines(tempPath, lines, new UTF8Encoding(false));
         File.Move(tempPath, EnvPath, overwrite: true);
 
         // 実行中のプロセスにもすぐ反映されるよう環境変数も更新する
@@ -325,7 +367,10 @@ public class AppSettings
         Environment.SetEnvironmentVariable("RECOGNITION_LANGUAGE", RecognitionLanguage);
         Environment.SetEnvironmentVariable("TARGET_LANGUAGE_CODE", TargetLanguageCode);
         Environment.SetEnvironmentVariable("TRANSLATION_BACKEND", TranslationBackend);
-        Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptedApiKey);
+        // ファイルへの書き込みと同じ理屈で、暗号化成否に応じて正しい方のキーだけに値を設定する
+        // (もう片方は空文字にして、LoadFromEnv側のフォールバック判定と矛盾しないようにする)
+        Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptResult.IsEncrypted ? encryptResult.Value : "");
+        Environment.SetEnvironmentVariable("DEEPL_API_KEY", encryptResult.IsEncrypted ? "" : encryptResult.Value);
         Environment.SetEnvironmentVariable("OLLAMA_MODEL", OllamaModel);
         Environment.SetEnvironmentVariable("OLLAMA_ENDPOINT", OllamaEndpoint);
         Environment.SetEnvironmentVariable("OLLAMA_CONTEXT", escapedContext);

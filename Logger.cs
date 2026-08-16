@@ -20,6 +20,40 @@ public static class Logger
     // exeの場所を基準にlogsフォルダへ出力する(AudioPipelineのモデルパス解決と同じ考え方)
     private static readonly string LogDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
 
+    // ログは1日単位でファイルが分かれるため急激な肥大化はしにくいが、放置すると際限なく増え続けるため、
+    // 起動のたびにこの日数より古いログファイルを削除する(古い順に消えるだけで、直近の調査には影響しない)
+    private const int LogRetentionDays = 30;
+    private static bool _oldLogsCleaned = false;
+
+    /// <summary>
+    /// 保持期間(LogRetentionDays)より古いログファイルを削除する。
+    /// アプリ起動後、最初のログ書き込み時に一度だけ実行する(毎回のログ出力のたびに
+    /// ディレクトリを走査するのは無駄なため)。ここでの失敗もアプリ本体には影響させない。
+    /// </summary>
+    private static void CleanupOldLogsIfNeeded()
+    {
+        if (_oldLogsCleaned) return;
+        _oldLogsCleaned = true;
+
+        try
+        {
+            if (!Directory.Exists(LogDirectory)) return;
+
+            var cutoff = DateTime.Now.AddDays(-LogRetentionDays);
+            foreach (var file in Directory.EnumerateFiles(LogDirectory, "*.log"))
+            {
+                if (File.GetLastWriteTime(file) < cutoff)
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+        catch
+        {
+            // 古いログの削除に失敗しても致命的ではないため無視する
+        }
+    }
+
     /// <summary>
     /// 診断ログを1行追記する。
     /// </summary>
@@ -30,6 +64,8 @@ public static class Logger
     {
         try
         {
+            CleanupOldLogsIfNeeded();
+
             var sb = new StringBuilder();
             sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
             sb.Append('\t').Append(component);
@@ -72,6 +108,8 @@ public static class Logger
     {
         try
         {
+            CleanupOldLogsIfNeeded();
+
             var sb = new StringBuilder();
             sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
             sb.Append('\t').Append(component);

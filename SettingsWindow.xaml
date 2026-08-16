@@ -92,17 +92,22 @@
                                    Style="{StaticResource HelpText}"/>
 
                         <TextBlock Text="相手側VAD" Style="{StaticResource SectionLabel}"/>
+                        <TextBlock Text="発話検出にはSilero VAD(ONNXニューラルモデル)を使用しており、音量だけでなく声道特有の周波数特性も加味して人声を検出します(モデルが利用できない場合は簡易的なRMS方式に自動フォールバックします)"
+                                   Style="{StaticResource HelpText}"/>
                         <Grid Margin="0,0,0,4">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="VAD感度(発話検出の閾値)" Style="{StaticResource FieldLabel}"/>
+                            <TextBlock Grid.Column="0" Text="VAD感度(発話検出の確率閾値)" Style="{StaticResource FieldLabel}"/>
                             <TextBlock Grid.Column="1" Foreground="#4da6ff" FontWeight="Bold"
-                                       Text="{Binding ElementName=VadThresholdSlider, Path=Value, StringFormat='{}{0:F3}'}"/>
+                                       Text="{Binding ElementName=VadThresholdSlider, Path=Value, StringFormat='{}{0:F2}'}"/>
                         </Grid>
-                        <Slider x:Name="VadThresholdSlider" Minimum="0.001" Maximum="0.05" TickFrequency="0.001"
-                                Value="0.015" IsMoveToPointEnabled="True" Margin="0,0,0,8"/>
+                        <Slider x:Name="VadThresholdSlider" Minimum="0.05" Maximum="0.95" TickFrequency="0.05"
+                                Value="0.5" IsMoveToPointEnabled="True" Margin="0,0,0,4"/>
+                        <TextBlock Text="値を大きくするほど、発話である確信度が高い音声だけを拾うようになります(誤検出は減りますが、小さい声や不明瞭な発話を拾いにくくなることがあります)"
+                                   Style="{StaticResource HelpText}"/>
+                        <TextBlock Text="" Margin="0,0,0,4"/>
 
                         <Grid Margin="0,0,0,4">
                             <Grid.ColumnDefinitions>

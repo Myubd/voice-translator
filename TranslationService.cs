@@ -26,8 +26,11 @@ public interface ITranslationService
 {
     Task<TranslationResult> TranslateAsync(string text);
 
-    /// <summary>セッション開始時に一度だけ呼ばれる準備処理。既定では何もしない</summary>
-    Task PrepareAsync() => Task.CompletedTask;
+    /// <summary>セッション開始時に一度だけ呼ばれる準備処理。既定では何もしない。
+    /// cancellationTokenはAudioPipeline.RunAsync全体のキャンセルトークンと同一のものが渡される。
+    /// 以前はキャンセル不可だったため、Ollamaが応答しない間はユーザーが「停止」を押しても
+    /// この処理が終わるまで停止できず、「開始したのに止められない」状態になっていた。</summary>
+    Task PrepareAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 /// <summary>
@@ -137,11 +140,20 @@ public class OllamaTranslationService : ITranslationService
         _context = context;
     }
 
+    // 用語集抽出自体のタイムアウト。ユーザーが「停止」した場合は外側のcancellationTokenで
+    // 即座に打ち切れるが、Ollamaが起動していない/無応答なだけの場合でも無期限に
+    // 待ち続けないよう上限を設けておく。
+    private static readonly TimeSpan PrepareTimeout = TimeSpan.FromSeconds(10);
+
     /// <summary>
     /// 参考コンテキストが設定されている場合、セッション開始時に一度だけ用語集を抽出しておく。
     /// 以降の翻訳では、生の参考コンテキストではなくこの短い用語集を使う。
+    ///
+    /// 以前はCancellationTokenを受け取っておらず、Ollamaが応答しない場合にユーザーが「停止」を
+    /// 押してもこの処理が完了するまで(=タイムアウトするまで)待たされていた。外側から渡される
+    /// cancellationTokenと、抽出自体の上限時間(PrepareTimeout)の両方で打ち切れるようにする。
     /// </summary>
-    public async Task PrepareAsync()
+    public async Task PrepareAsync(CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(_context))
         {
@@ -168,14 +180,16 @@ public class OllamaTranslationService : ITranslationService
             using var request = new HttpRequestMessage(HttpMethod.Post, $"{_endpoint}/api/generate");
             request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
 
-            using var response = await _httpClient.SendAsync(request);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(PrepareTimeout);
+            using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
                 _glossary = null;
                 return;
             }
 
-            var json = await response.Content.ReadAsStringAsync();
+            var json = await response.Content.ReadAsStringAsync(timeoutCts.Token);
             using var doc = JsonDocument.Parse(json);
             var extracted = doc.RootElement.GetProperty("response").GetString()?.Trim();
 
@@ -188,10 +202,17 @@ public class OllamaTranslationService : ITranslationService
 
             _glossary = BuildValidatedGlossary(extracted);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // ユーザーが「停止」を押した場合。用語集無しで(=呼び出し元へ)そのまま抜ける
+            _glossary = null;
+            throw;
+        }
         catch (Exception ex)
         {
             // 抽出に失敗しても翻訳自体は続行できるようにする(コンテキスト無しにフォールバック)。
             // ただし「なぜ用語集が反映されないのか」が分かるよう原因は記録しておく
+            // (タイムアウト単体の場合もここに含まれ、ユーザー操作によるキャンセルとは区別している)
             Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。用語集無しで続行します。", ex);
             _glossary = null;
         }

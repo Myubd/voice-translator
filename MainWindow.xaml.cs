@@ -37,6 +37,11 @@ public partial class MainWindow : Window
     private OverlayWindow? _overlayWindow;
     private HotkeyManager? _hotkeyManager;
     private bool _translationEnabledForRun = false;
+    // 実行中のAudioPipeline.RunAsyncタスク。Closing時にawaitして、WASAPIデバイスや
+    // Whisperモデルの解放が完了するのを待ってからプロセスを終了させるために保持する
+    // (以前はここを保持しておらず、Closingは_cts.Cancel()を呼ぶだけの同期処理だったため、
+    // RunAsync側の非同期な後片付けが完了する前にプロセスが終了してしまう可能性があった)。
+    private Task? _pipelineTask;
 
     /// <summary>Id → TranslatedListBox上の行インデックス。原文が届いた時点で「翻訳中…」の
     /// プレースホルダーをこのインデックスに追加しておき、翻訳結果(成功/失敗)が届いたら
@@ -46,6 +51,17 @@ public partial class MainWindow : Window
     /// <summary>Id → 実際の発話区間(開始/終了時刻)。SRTエクスポート時に実時間ベースの
     /// タイムスタンプを出力するために保持する。</summary>
     private readonly Dictionary<long, (TimeSpan Start, TimeSpan End)> _segmentTimesById = new();
+
+    /// <summary>今回のセッション(開始ボタンを押してから)より前の、累積セッション時間。
+    /// AudioPipeline側のタイムスタンプ(_audioSamplesRead基準)は開始/停止のたびに0から
+    /// リセットされるため、「停止して再度開始」を繰り返した状態で1つのSRTとしてエクスポートすると、
+    /// 複数セッション分のタイムスタンプが0近辺で重複してしまう。この値を各セグメントの
+    /// タイムスタンプに足し込むことで、複数セッションをまたいでも単調増加するようにする。</summary>
+    private TimeSpan _sessionTimeOffset = TimeSpan.Zero;
+
+    /// <summary>今回のセッションで受信した最後のセグメント終了時刻(セッション内相対)。
+    /// 次のセッション開始時に_sessionTimeOffsetへ積み増すために保持する。</summary>
+    private TimeSpan _lastSegmentEndTimeInSession = TimeSpan.Zero;
 
     /// <summary>ステータス欄に表示中の翻訳エラーを、一定時間後に元の状態表示へ戻すためのタイマー。
     /// 以前はエラー発生後、次に何かステータスが変わるまでエラーメッセージが表示され続け、
@@ -69,7 +85,11 @@ public partial class MainWindow : Window
             Dispatcher.Invoke(() =>
             {
                 var timestamp = DateTime.Now.ToString("HH:mm:ss");
-                _segmentTimesById[args.Id] = (args.SegmentStartTime, args.SegmentEndTime);
+                // セッションをまたいでタイムスタンプが重複/逆行しないよう、累積オフセットを足し込む
+                var start = _sessionTimeOffset + args.SegmentStartTime;
+                var end = _sessionTimeOffset + args.SegmentEndTime;
+                _segmentTimesById[args.Id] = (start, end);
+                if (args.SegmentEndTime > _lastSegmentEndTimeInSession) _lastSegmentEndTimeInSession = args.SegmentEndTime;
                 OriginalListBox.Items.Add(new TranscriptLine(args.Id, timestamp, args.Text));
                 OriginalListBox.ScrollIntoView(OriginalListBox.Items[^1]);
 
@@ -109,6 +129,22 @@ public partial class MainWindow : Window
             });
         };
 
+        // 翻訳待ちキューが満杯になり、翻訳される前に破棄された行。以前はここで何も起きず、
+        // 該当行の「翻訳中…」プレースホルダーが永遠に残ってしまっていた。
+        _pipeline.TranscriptItemSkipped += id =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                if (_translatedRowIndexById.TryGetValue(id, out var index) && index < TranslatedListBox.Items.Count)
+                {
+                    var existing = (TranscriptLine)TranslatedListBox.Items[index];
+                    // 「(翻訳失敗)」(=翻訳APIへ送ったが失敗した)とは意図的に文言を分け、
+                    // 「処理が追いつかず、そもそも翻訳されなかった」ことが分かるようにする
+                    TranslatedListBox.Items[index] = existing with { Text = "(処理遅延によりスキップ)" };
+                }
+            });
+        };
+
         _pipeline.StatusChanged += status =>
         {
             Dispatcher.Invoke(() =>
@@ -144,6 +180,14 @@ public partial class MainWindow : Window
             Dispatcher.Invoke(() => { _transcriptDropCount = count; UpdateDropCountText(); });
         };
 
+        // WASAPI→BufferedWaveProviderの段階での破棄は、Whisperキュー/翻訳キューのdropとは異なり
+        // 「音声そのものが一度もWhisperに渡らない」という、最もユーザーに気付かれにくい欠落。
+        // 少なくとも累計バイト数を警告として表示する。
+        _pipeline.AudioBufferOverflowOccurred += totalDroppedBytes =>
+        {
+            Dispatcher.Invoke(() => { _audioOverflowBytes = totalDroppedBytes; UpdateDropCountText(); });
+        };
+
         // 「VAD開始→Whisper完了→翻訳完了」の累積遅延を表示する。数値が大きくなり続ける場合、
         // 処理が実際の発話に追いつけていないサイン(CPU負荷や翻訳APIの遅延など)として気づける。
         _pipeline.LatencyMeasured += measurement =>
@@ -161,19 +205,49 @@ public partial class MainWindow : Window
 
     private int _segmentDropCount = 0;
     private int _transcriptDropCount = 0;
+    private long _audioOverflowBytes = 0;
 
-    /// <summary>音声セグメント破棄・翻訳待ちテキスト破棄、両方の件数を1つの警告表示にまとめる。
-    /// 発生段階(Whisperキュー/翻訳キュー)が異なるため、どちらでどれだけ破棄されたか分かるようにする。</summary>
+    /// <summary>音声セグメント破棄・翻訳待ちテキスト破棄・音声バッファoverflow、すべての件数を
+    /// 1つの警告表示にまとめる。発生段階(WASAPIバッファ/Whisperキュー/翻訳キュー)が異なるため、
+    /// どちらでどれだけ破棄されたか分かるようにする。</summary>
     private void UpdateDropCountText()
     {
         var parts = new List<string>();
+        if (_audioOverflowBytes > 0) parts.Add($"音声バッファ溢れ{_audioOverflowBytes / 1024}KB");
         if (_segmentDropCount > 0) parts.Add($"音声認識待ち{_segmentDropCount}件");
         if (_transcriptDropCount > 0) parts.Add($"翻訳待ち{_transcriptDropCount}件");
-        DropCountText.Text = parts.Count > 0 ? $"⚠ 処理遅延のためスキップ: {string.Join(" / ", parts)}" : "";
+        DropCountText.Text = parts.Count > 0 ? $"⚠ 処理が追いつかず音声をスキップしました: {string.Join(" / ", parts)}" : "";
     }
 
-    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    private bool _isClosingConfirmed = false;
+
+    private async void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        // AudioPipeline.RunAsyncが完全に終了する(WASAPIデバイス/Whisperモデルの解放が終わる)前に
+        // プロセスが終了してしまうのを防ぐため、いったんClosingをキャンセルしてタスクの完了を待ち、
+        // 完了後に改めてShutdownする。以前はCancel()を呼ぶだけで非同期の後片付けをawaitしていなかった。
+        if (_isRunning && !_isClosingConfirmed)
+        {
+            e.Cancel = true;
+            _cts?.Cancel();
+
+            if (_pipelineTask != null)
+            {
+                try
+                {
+                    await _pipelineTask;
+                }
+                catch
+                {
+                    // 終了処理中の例外はここでは無視する(StartStopButton_Click側で既にログ済み)
+                }
+            }
+
+            _isClosingConfirmed = true;
+            Close();
+            return;
+        }
+
         // 録音・翻訳タスクが動いたままアプリを終了すると、バックグラウンドタスクが残り続けたり
         // 未保存のオーバーレイ状態が残ったりする恐れがあるため、終了時に明示的に片付ける。
         _hotkeyManager?.Dispose();
@@ -181,6 +255,10 @@ public partial class MainWindow : Window
         _cts?.Dispose();
         _overlayWindow?.Close();
         _httpClient.Dispose();
+        // Silero VADのONNXセッション(ネイティブリソース)を解放する。
+        // RunAsyncが動いていない状態でのみ呼ぶこと(このメソッドに到達する時点で、
+        // 実行中だった場合は上のif節でawait済みのため、ここでは確実に停止している)。
+        _pipeline.Dispose();
     }
 
     /// <summary>ゲームプレイ中はAlt-Tabせずに操作したいという要望に応え、
@@ -259,9 +337,12 @@ public partial class MainWindow : Window
         }
 
         // ゲーム音声優先モードがONの場合、VAD閾値を引き上げて小さい雑音より
-        // 大きいゲーム音声を優先的に拾うようにする(倍率は設定画面で調整可能)
+        // 大きいゲーム音声を優先的に拾うようにする(倍率は設定画面で調整可能)。
+        // VAD閾値はSilero VAD使用時は確率(0〜1)のスケールのため、倍率をそのまま掛けると
+        // 1.0を超えてしまい得る(1.0超は「絶対に発話と判定されない」という意味になり、
+        // ゲーム音声優先どころかVADが完全に機能しなくなる)。そのため0.97を上限にclampする。
         _pipeline.EnergyThreshold = _settings.GameAudioPriorityMode
-            ? _settings.VadThreshold * _settings.GameAudioPriorityMultiplier
+            ? Math.Min(0.97f, _settings.VadThreshold * _settings.GameAudioPriorityMultiplier)
             : _settings.VadThreshold;
         _pipeline.HysteresisRatio = _settings.VadHysteresisRatio;
         var translationService = _settings.CreateTranslationService(_httpClient);
@@ -274,9 +355,19 @@ public partial class MainWindow : Window
         _translatedRowIndexById.Clear();
         _segmentDropCount = 0;
         _transcriptDropCount = 0;
+        _audioOverflowBytes = 0;
         DropCountText.Text = "";
         LatencyText.Text = "";
         _statusErrorClearTimer.Stop();
+
+        // AudioPipeline側のタイムスタンプは開始のたびに0からリセットされるが、
+        // Id(_segmentTimesById)は「Clear」ボタンを押すまでセッションをまたいで保持され続ける。
+        // そのため、2回目以降の開始では前回セッションの最終時刻をオフセットとして積み増し、
+        // SRTエクスポート時に複数セッション分のタイムスタンプが0近辺で重複しないようにする。
+        // (初回起動時は両方0のためこの行は実質no-op)
+        _sessionTimeOffset += _lastSegmentEndTimeInSession;
+        _lastSegmentEndTimeInSession = TimeSpan.Zero;
+
         _cts?.Dispose();
         _cts = new CancellationTokenSource();
         SetRunningUiState(true);
@@ -284,7 +375,8 @@ public partial class MainWindow : Window
 
         try
         {
-            await _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
+            _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
+            await _pipelineTask;
         }
         catch (OperationCanceledException)
         {
@@ -297,6 +389,7 @@ public partial class MainWindow : Window
         }
         finally
         {
+            _pipelineTask = null;
             SetRunningUiState(false);
         }
     }
@@ -317,7 +410,7 @@ public partial class MainWindow : Window
 
     private void SettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        var settingsWindow = new SettingsWindow(_settings);
+        var settingsWindow = new SettingsWindow(_settings, _httpClient);
         if (settingsWindow.ShowDialog() == true)
         {
             _settings = settingsWindow.Settings;
@@ -333,6 +426,11 @@ public partial class MainWindow : Window
         TranslatedListBox.Items.Clear();
         _translatedRowIndexById.Clear();
         _segmentTimesById.Clear();
+        // 表示している発話をすべて消したので、次にタイムスタンプが重複する心配は無くなった。
+        // ここでリセットしないと、Clear後に長時間放置してから話した場合、次のSRTの先頭行が
+        // 不必要に大きいオフセット付きの時刻から始まってしまう
+        _sessionTimeOffset = TimeSpan.Zero;
+        _lastSegmentEndTimeInSession = TimeSpan.Zero;
         _overlayWindow?.ClearLines();
     }
 
@@ -431,8 +529,8 @@ public partial class MainWindow : Window
         foreach (TranscriptLine line in TranslatedListBox.Items)
         {
             if (!_segmentTimesById.TryGetValue(line.Id, out var times)) continue;
-            // 翻訳中/翻訳失敗のプレースホルダーはSRTに含めない
-            if (line.Text == "(翻訳中…)" || line.Text == "(翻訳失敗)") continue;
+            // 翻訳中/翻訳失敗/処理遅延スキップのプレースホルダーはSRTに含めない
+            if (line.Text == "(翻訳中…)" || line.Text == "(翻訳失敗)" || line.Text == "(処理遅延によりスキップ)") continue;
 
             sb.AppendLine(index.ToString());
             sb.AppendLine($"{times.Start:hh\\:mm\\:ss\\,fff} --> {times.End:hh\\:mm\\:ss\\,fff}");
