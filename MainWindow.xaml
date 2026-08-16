@@ -85,6 +85,7 @@
                 </StackPanel>
 
                 <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                    <TextBlock x:Name="LatencyText" Text="" VerticalAlignment="Center" Foreground="#8899cc" Margin="0,0,12,0"/>
                     <TextBlock x:Name="DropCountText" Text="" VerticalAlignment="Center" Foreground="#ffaa66" Margin="0,0,12,0"/>
                     <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#666677" Margin="0,0,6,0"/>
                     <TextBlock x:Name="StatusText" Text="停止中" VerticalAlignment="Center" Foreground="#aaaaba"/>

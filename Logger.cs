@@ -58,4 +58,39 @@ public static class Logger
             // ロギング自体が失敗しても、それが原因でアプリの動作に影響してはいけないため無視する
         }
     }
+
+    /// <summary>
+    /// 処理時間・キュー長・drop数などの計測値を構造化して記録する(診断・チューニング用)。
+    /// Log()は「何か問題が起きた時」に例外とともに記録する想定だが、こちらは正常系でも
+    /// 継続的に出力し、後から「どこで遅延が発生しているか」を分析できるようにする
+    /// (Whisper処理時間・翻訳処理時間・キュー長・drop数・累積遅延などをkey=value形式で残す)。
+    /// 呼び出し頻度が高くなりうるため、こちらもLog()同様に例外は握りつぶし、アプリ本体には影響させない。
+    /// </summary>
+    /// <param name="component">計測対象(例: "Latency", "Queue")</param>
+    /// <param name="fields">key=value形式で記録したい値の一覧</param>
+    public static void LogMetric(string component, params (string Key, object Value)[] fields)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"));
+            sb.Append('\t').Append(component);
+            foreach (var (key, value) in fields)
+            {
+                sb.Append('\t').Append(key).Append('=').Append(value);
+            }
+
+            var line = sb.ToString();
+            var filePath = Path.Combine(LogDirectory, $"metrics-{DateTime.Now:yyyyMMdd}.log");
+
+            lock (WriteLock)
+            {
+                Directory.CreateDirectory(LogDirectory);
+                File.AppendAllText(filePath, line + Environment.NewLine, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+        }
+    }
 }

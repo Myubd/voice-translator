@@ -4,6 +4,7 @@ obj/
 *.user
 .vs/
 *.zip
+*.xml
 
 # APIキーなど秘密情報(.env.exampleだけコミットする)
 .env

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Input;
 
@@ -75,7 +76,17 @@ public class AppSettings
         return (modifiers, key);
     }
 
-    private const string EnvPath = ".env";
+    // exeがどのディレクトリから起動されても同じ.envを見つけられるよう、Whisperモデルパスや
+    // ログと同じくAppContext.BaseDirectory基準で解決する。以前はカレントディレクトリ基準("./.env")
+    // だったため、ショートカット経由の起動や別ディレクトリからの起動で.envが見つからない、
+    // または意図しない場所に新規作成されてしまう不具合があった。
+    private static readonly string EnvPath = Path.Combine(AppContext.BaseDirectory, ".env");
+
+    // DeepL APIキーを.envに保存する際の暗号化に使うエントロピー(ソルトのようなもの)。
+    // Windows DPAPIはユーザーアカウントに紐づけて暗号化するため、これと組み合わせることで
+    // 「.envファイルをそのままコピー/誤共有/誤アップロードされても、同じWindowsユーザーの
+    // 同じPC以外では復号できない」形にする。
+    private static readonly byte[] DeepLKeyEntropy = Encoding.UTF8.GetBytes("LoopbackRecorder.DeepLApiKey.v1");
 
     public static AppSettings LoadFromEnv()
     {
@@ -86,11 +97,18 @@ public class AppSettings
             DeviceKeyword = Environment.GetEnvironmentVariable("DEVICE_KEYWORD") ?? "Chat",
             DeviceId = Environment.GetEnvironmentVariable("DEVICE_ID") ?? "",
             TranslationBackend = Environment.GetEnvironmentVariable("TRANSLATION_BACKEND") ?? "deepl",
-            DeepLApiKey = Environment.GetEnvironmentVariable("DEEPL_API_KEY") ?? "",
             OllamaModel = Environment.GetEnvironmentVariable("OLLAMA_MODEL") ?? "llama3.1",
             OllamaEndpoint = Environment.GetEnvironmentVariable("OLLAMA_ENDPOINT") ?? "http://localhost:11434",
             WhisperModelPath = Environment.GetEnvironmentVariable("WHISPER_MODEL_PATH") ?? "ggml-base.bin",
         };
+
+        // DeepL APIキー: DPAPIで暗号化された新形式(DEEPL_API_KEY_ENC)を優先して読み込む。
+        // 旧バージョンの平文保存(DEEPL_API_KEY)しか無い場合はそちらを読み込み、
+        // 次回SaveToEnv()時に自動的に暗号化形式へ移行される。
+        var encryptedKey = Environment.GetEnvironmentVariable("DEEPL_API_KEY_ENC");
+        settings.DeepLApiKey = !string.IsNullOrEmpty(encryptedKey)
+            ? DecryptDeepLApiKey(encryptedKey)
+            : Environment.GetEnvironmentVariable("DEEPL_API_KEY") ?? "";
 
         // .envのような設定ファイルはOSのカルチャ(小数点がカンマになる地域設定等)に
         // 影響されると壊れるため、数値の読み書きは必ずInvariantCultureで行う
@@ -167,6 +185,52 @@ public class AppSettings
         return trimmed;
     }
 
+    /// <summary>
+    /// DeepL APIキーをWindows DPAPI(現在のWindowsユーザーアカウント紐付け)で暗号化し、
+    /// .envファイルに書き込める形(Base64文字列)にする。
+    /// 非Windows環境(開発機など)ではDPAPIが使えないため、平文のまま返す。
+    /// </summary>
+    private static string EncryptDeepLApiKey(string plainText)
+    {
+        if (string.IsNullOrEmpty(plainText)) return "";
+        if (!OperatingSystem.IsWindows()) return plainText;
+
+        try
+        {
+            var bytes = Encoding.UTF8.GetBytes(plainText);
+            var protectedBytes = ProtectedData.Protect(bytes, DeepLKeyEntropy, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(protectedBytes);
+        }
+        catch (Exception ex)
+        {
+            // 暗号化に失敗した場合でも設定の保存自体は止めたくないため、平文でフォールバックする。
+            // (この場合でも次回起動時にDEEPL_API_KEY_ENCとして読み込まれ、再暗号化が試みられる)
+            Logger.Log("AppSettings", "DeepL APIキーの暗号化に失敗しました。平文で保存します。", ex);
+            return plainText;
+        }
+    }
+
+    /// <summary>EncryptDeepLApiKeyで暗号化された文字列を復号する。
+    /// 別PC/別Windowsユーザーで保存された.envを読み込んだ場合など、復号できない値は
+    /// 空文字を返す(ユーザーには再入力を促す形になる)。</summary>
+    private static string DecryptDeepLApiKey(string storedValue)
+    {
+        if (string.IsNullOrEmpty(storedValue)) return "";
+        if (!OperatingSystem.IsWindows()) return storedValue;
+
+        try
+        {
+            var protectedBytes = Convert.FromBase64String(storedValue);
+            var bytes = ProtectedData.Unprotect(protectedBytes, DeepLKeyEntropy, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(bytes);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("AppSettings", "DeepL APIキーの復号に失敗しました(別PC/別ユーザーの.env、または破損の可能性)。再入力が必要です。", ex);
+            return "";
+        }
+    }
+
     /// <summary>現在の設定を.envファイルに書き戻す(キー以外の項目も含めて保存する)</summary>
     public void SaveToEnv()
     {
@@ -176,6 +240,7 @@ public class AppSettings
         var escapedContext = OllamaContext.Replace("\r\n", "\n").Replace("\n", "\\n");
         var escapedPrompt = WhisperPrompt.Replace("\r\n", "\n").Replace("\n", "\\n");
         OllamaEndpoint = NormalizeEndpoint(OllamaEndpoint);
+        var encryptedApiKey = EncryptDeepLApiKey(DeepLApiKey);
 
         var lines = new List<string>
         {
@@ -218,8 +283,10 @@ public class AppSettings
             "# 翻訳バックエンド: \"deepl\" または \"ollama\"",
             $"TRANSLATION_BACKEND={TranslationBackend}",
             "",
-            "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)",
-            $"DEEPL_API_KEY={DeepLApiKey}",
+            "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)。",
+            "# Windows DPAPIで暗号化して保存しているため、このファイルを他PC/他ユーザーへ",
+            "# コピーしても復号できない(このPC・このWindowsユーザーでのみ有効)。",
+            $"DEEPL_API_KEY_ENC={encryptedApiKey}",
             "",
             "# Ollama(ローカルAI)を使う場合に使用するモデル名",
             $"OLLAMA_MODEL={OllamaModel}",
@@ -258,7 +325,7 @@ public class AppSettings
         Environment.SetEnvironmentVariable("RECOGNITION_LANGUAGE", RecognitionLanguage);
         Environment.SetEnvironmentVariable("TARGET_LANGUAGE_CODE", TargetLanguageCode);
         Environment.SetEnvironmentVariable("TRANSLATION_BACKEND", TranslationBackend);
-        Environment.SetEnvironmentVariable("DEEPL_API_KEY", DeepLApiKey);
+        Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptedApiKey);
         Environment.SetEnvironmentVariable("OLLAMA_MODEL", OllamaModel);
         Environment.SetEnvironmentVariable("OLLAMA_ENDPOINT", OllamaEndpoint);
         Environment.SetEnvironmentVariable("OLLAMA_CONTEXT", escapedContext);

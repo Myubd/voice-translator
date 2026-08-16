@@ -213,6 +213,19 @@ public partial class SettingsWindow : Window
         }
     }
 
+    /// <summary>
+    /// 「モデル一覧を更新」ボタン。
+    /// 以前はOllamaEndpointTextBox自体の変更を監視しておらず、「Ollamaに切り替えた瞬間、
+    /// モデル一覧が空の場合のみ自動取得する」条件だったため、エンドポイントを書き換えても
+    /// 一覧は古いまま(または空のまま)で、設定画面を一度閉じて開き直さないと反映されなかった。
+    /// TextChangedでの自動更新は「入力中に何度もOllamaへリクエストが飛ぶ」ことになり
+    /// かえって扱いにくいため、明示的なボタンとして提供する。
+    /// </summary>
+    private void OllamaEndpointRefreshButton_Click(object sender, RoutedEventArgs e)
+    {
+        _ = LoadOllamaModelsAsync();
+    }
+
     private void UpdateBackendPanelsVisibility()
     {
         // XAMLロード中(まだ子要素が無い)は何もしない

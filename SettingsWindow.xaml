@@ -193,7 +193,17 @@
                                     </TextBlock.ToolTip>
                                 </TextBlock>
                             </StackPanel>
-                            <TextBox x:Name="OllamaEndpointTextBox" Margin="0,0,0,4"/>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="OllamaEndpointTextBox" Grid.Column="0" Margin="0,0,4,0"/>
+                                <Button x:Name="OllamaEndpointRefreshButton" Grid.Column="1" Content="モデル一覧を更新"
+                                        Click="OllamaEndpointRefreshButton_Click"/>
+                            </Grid>
+                            <TextBlock Text="エンドポイントを変更した場合は「モデル一覧を更新」でこの接続先のモデルを再取得してください"
+                                       Style="{StaticResource HelpText}"/>
                         </StackPanel>
                     </StackPanel>
                 </ScrollViewer>

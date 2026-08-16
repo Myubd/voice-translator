@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Text;
@@ -6,67 +7,169 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Microsoft.Win32;
 
 namespace LoopbackRecorder;
 
-/// <summary>原文/訳文リストの1行分。タイムスタンプと本文を別々に色分け表示するために使う</summary>
-public record TranscriptLine(string Timestamp, string Text);
+/// <summary>原文/訳文リストの1行分。タイムスタンプと本文を別々に色分け表示するために使う。
+/// Idは元のSpeechSegment/TranscriptItemと同じ値で、原文側・訳文側の行を対応付けるために使う
+/// (以前はリストの「インデックス」だけで対応付けていたため、翻訳が1件失敗すると
+/// 以降すべての行がズレる不具合があった)。</summary>
+public record TranscriptLine(long Id, string Timestamp, string Text);
 
 public partial class MainWindow : Window
 {
     private readonly AudioPipeline _pipeline = new AudioPipeline();
-    private readonly HttpClient _httpClient = new HttpClient();
+
+    // HttpClientはアプリ起動中ずっと使い回す(NAudio/Whisperのような長時間稼働アプリとして正しい方針)。
+    // ただしSocketsHttpHandler.PooledConnectionLifetimeを設定しないと、DeepL/Ollama側でDNSレコードが
+    // 変わった場合(サーバー移転やロードバランサ変更等)に古い接続を握り続けてしまう可能性があるため、
+    // 数十分単位のライフタイムを明示しておく。
+    private readonly HttpClient _httpClient = new HttpClient(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(15)
+    });
+
     private AppSettings _settings = AppSettings.LoadFromEnv();
     private CancellationTokenSource? _cts;
     private bool _isRunning = false;
     private OverlayWindow? _overlayWindow;
     private HotkeyManager? _hotkeyManager;
+    private bool _translationEnabledForRun = false;
+
+    /// <summary>Id → TranslatedListBox上の行インデックス。原文が届いた時点で「翻訳中…」の
+    /// プレースホルダーをこのインデックスに追加しておき、翻訳結果(成功/失敗)が届いたら
+    /// 同じ位置を書き換える。これにより翻訳の成否によらず原文/訳文の行が常に揃う。</summary>
+    private readonly Dictionary<long, int> _translatedRowIndexById = new();
+
+    /// <summary>Id → 実際の発話区間(開始/終了時刻)。SRTエクスポート時に実時間ベースの
+    /// タイムスタンプを出力するために保持する。</summary>
+    private readonly Dictionary<long, (TimeSpan Start, TimeSpan End)> _segmentTimesById = new();
+
+    /// <summary>ステータス欄に表示中の翻訳エラーを、一定時間後に元の状態表示へ戻すためのタイマー。
+    /// 以前はエラー発生後、次に何かステータスが変わるまでエラーメッセージが表示され続け、
+    /// 実際には回復していても「まだ壊れている」ように見えてしまっていた。</summary>
+    private readonly DispatcherTimer _statusErrorClearTimer;
 
     public MainWindow()
     {
         InitializeComponent();
 
-        _pipeline.OriginalTextReceived += text =>
+        _statusErrorClearTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(6) };
+        _statusErrorClearTimer.Tick += (_, _) =>
+        {
+            _statusErrorClearTimer.Stop();
+            // エラー表示前の状態に戻す。実行中なら「認識中」相当の表示に、停止中なら「停止中」に。
+            StatusText.Text = _isRunning ? "認識中…" : "停止中";
+        };
+
+        _pipeline.OriginalTextReceived += args =>
         {
             Dispatcher.Invoke(() =>
             {
-                OriginalListBox.Items.Add(new TranscriptLine(DateTime.Now.ToString("HH:mm:ss"), text));
+                var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                _segmentTimesById[args.Id] = (args.SegmentStartTime, args.SegmentEndTime);
+                OriginalListBox.Items.Add(new TranscriptLine(args.Id, timestamp, args.Text));
                 OriginalListBox.ScrollIntoView(OriginalListBox.Items[^1]);
+
+                if (_translationEnabledForRun)
+                {
+                    // 翻訳結果を待たず、まず「翻訳中…」のプレースホルダーを同じ行位置に追加する。
+                    // これで原文/訳文の2ペインが常に行単位で揃った状態を保てる。
+                    int index = TranslatedListBox.Items.Add(new TranscriptLine(args.Id, timestamp, "(翻訳中…)"));
+                    _translatedRowIndexById[args.Id] = index;
+                }
             });
         };
 
-        _pipeline.TranslatedTextReceived += text =>
+        _pipeline.TranslatedTextReceived += args =>
         {
             Dispatcher.Invoke(() =>
             {
-                TranslatedListBox.Items.Add(new TranscriptLine(DateTime.Now.ToString("HH:mm:ss"), text));
-                TranslatedListBox.ScrollIntoView(TranslatedListBox.Items[^1]);
-                _overlayWindow?.AddTranslatedLine(text);
+                var displayText = args.Text ?? "(翻訳失敗)";
+
+                if (_translatedRowIndexById.TryGetValue(args.Id, out var index) && index < TranslatedListBox.Items.Count)
+                {
+                    var existing = (TranscriptLine)TranslatedListBox.Items[index];
+                    TranslatedListBox.Items[index] = existing with { Text = displayText };
+                }
+                else
+                {
+                    // プレースホルダーが見つからない場合(翻訳無効時からの切り替え等の想定外パス)の保険
+                    var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                    TranslatedListBox.Items.Add(new TranscriptLine(args.Id, timestamp, displayText));
+                }
+
+                if (args.Text != null)
+                {
+                    TranslatedListBox.ScrollIntoView(TranslatedListBox.Items[^1]);
+                    _overlayWindow?.AddTranslatedLine(args.Text);
+                }
             });
         };
 
         _pipeline.StatusChanged += status =>
         {
-            Dispatcher.Invoke(() => StatusText.Text = status);
+            Dispatcher.Invoke(() =>
+            {
+                _statusErrorClearTimer.Stop();
+                StatusText.Text = status;
+            });
         };
 
         // DeepL/Ollamaの翻訳失敗は、これまでConsole.WriteLineのみでUIに一切出ていなかった。
         // ステータス欄に出すことで、配布後のユーザーでも「翻訳が出ない理由」に気づけるようにする。
+        // 単発の一時的なエラー(タイムアウト等)でも、以前は次に何かステータスが変わるまで
+        // エラーメッセージが表示され続け、実際には回復していても「まだ壊れている」ように
+        // 見えてしまっていたため、一定時間後に通常表示へ自動的に戻すようにする。
         _pipeline.TranslationErrorOccurred += error =>
         {
-            Dispatcher.Invoke(() => StatusText.Text = error);
+            Dispatcher.Invoke(() =>
+            {
+                StatusText.Text = error;
+                _statusErrorClearTimer.Stop();
+                _statusErrorClearTimer.Start();
+            });
         };
 
         // 処理が追いつかず音声セグメントが破棄された場合、これまでは何も表示されず
         // 「なぜか一部の発話が翻訳されない」状態にしか見えなかった。件数を表示して気づけるようにする
         _pipeline.SegmentsDropped += count =>
         {
-            Dispatcher.Invoke(() => DropCountText.Text = $"⚠ 処理遅延のため音声セグメントを{count}件スキップしました");
+            Dispatcher.Invoke(() => { _segmentDropCount = count; UpdateDropCountText(); });
+        };
+        _pipeline.TranscriptsDropped += count =>
+        {
+            Dispatcher.Invoke(() => { _transcriptDropCount = count; UpdateDropCountText(); });
+        };
+
+        // 「VAD開始→Whisper完了→翻訳完了」の累積遅延を表示する。数値が大きくなり続ける場合、
+        // 処理が実際の発話に追いつけていないサイン(CPU負荷や翻訳APIの遅延など)として気づける。
+        _pipeline.LatencyMeasured += measurement =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                LatencyText.Text = $"遅延: {measurement.TotalLag.TotalSeconds:0.0}秒" +
+                    $" (認識 {measurement.WhisperDuration.TotalSeconds:0.0}s / 翻訳 {measurement.TranslationDuration.TotalSeconds:0.0}s)";
+            });
         };
 
         Closing += MainWindow_Closing;
         Loaded += (_, _) => RegisterHotkeys();
+    }
+
+    private int _segmentDropCount = 0;
+    private int _transcriptDropCount = 0;
+
+    /// <summary>音声セグメント破棄・翻訳待ちテキスト破棄、両方の件数を1つの警告表示にまとめる。
+    /// 発生段階(Whisperキュー/翻訳キュー)が異なるため、どちらでどれだけ破棄されたか分かるようにする。</summary>
+    private void UpdateDropCountText()
+    {
+        var parts = new List<string>();
+        if (_segmentDropCount > 0) parts.Add($"音声認識待ち{_segmentDropCount}件");
+        if (_transcriptDropCount > 0) parts.Add($"翻訳待ち{_transcriptDropCount}件");
+        DropCountText.Text = parts.Count > 0 ? $"⚠ 処理遅延のためスキップ: {string.Join(" / ", parts)}" : "";
     }
 
     private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -161,9 +264,19 @@ public partial class MainWindow : Window
             ? _settings.VadThreshold * _settings.GameAudioPriorityMultiplier
             : _settings.VadThreshold;
         _pipeline.HysteresisRatio = _settings.VadHysteresisRatio;
-        _pipeline.ConfigureTranslation(_settings.CreateTranslationService(_httpClient));
+        var translationService = _settings.CreateTranslationService(_httpClient);
+        _translationEnabledForRun = translationService != null;
+        _pipeline.ConfigureTranslation(translationService);
 
+        // 今回の実行(セッション)向けの表示状態をリセットする。
+        // 「翻訳中…」プレースホルダーの行インデックス対応もここでリセットしないと、
+        // 前回セッションのIdが残ったまま新しいセッションのIdと混ざってしまう
+        _translatedRowIndexById.Clear();
+        _segmentDropCount = 0;
+        _transcriptDropCount = 0;
         DropCountText.Text = "";
+        LatencyText.Text = "";
+        _statusErrorClearTimer.Stop();
         _cts?.Dispose();
         _cts = new CancellationTokenSource();
         SetRunningUiState(true);
@@ -218,6 +331,8 @@ public partial class MainWindow : Window
     {
         OriginalListBox.Items.Clear();
         TranslatedListBox.Items.Clear();
+        _translatedRowIndexById.Clear();
+        _segmentTimesById.Clear();
         _overlayWindow?.ClearLines();
     }
 
@@ -272,41 +387,58 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// 原文リストの各行をIdをキーに訳文リストと対応付けてテキスト出力する。
+    /// 以前は単純にリストの「インデックス」で原文/訳文をペアにしていたため、
+    /// 翻訳が1件でも失敗すると訳文側リストにはその回だけ追加されず、以降すべての行で
+    /// インデックスが1つずつズレて無関係な訳文が対応付けられてしまう不具合があった。
+    /// 現在は原文側イベントで確定するIdを両リストの行が共通で持っているため、
+    /// Idで引き当てることでこのズレが発生しない(翻訳失敗行は「(翻訳失敗)」がそのまま出力される)。
+    /// </summary>
     private void ExportAsText(string path)
     {
-        var sb = new StringBuilder();
-        int count = Math.Max(OriginalListBox.Items.Count, TranslatedListBox.Items.Count);
-        for (int i = 0; i < count; i++)
+        var translatedById = new Dictionary<long, TranscriptLine>();
+        foreach (TranscriptLine line in TranslatedListBox.Items)
         {
-            var original = i < OriginalListBox.Items.Count ? (TranscriptLine)OriginalListBox.Items[i] : null;
-            var translated = i < TranslatedListBox.Items.Count ? (TranscriptLine)TranslatedListBox.Items[i] : null;
+            translatedById[line.Id] = line;
+        }
 
-            var timestamp = original?.Timestamp ?? translated?.Timestamp ?? "";
-            sb.AppendLine($"[{timestamp}]");
-            if (original != null) sb.AppendLine($"原文: {original.Text}");
-            if (translated != null) sb.AppendLine($"訳文: {translated.Text}");
+        var sb = new StringBuilder();
+        foreach (TranscriptLine original in OriginalListBox.Items)
+        {
+            sb.AppendLine($"[{original.Timestamp}]");
+            sb.AppendLine($"原文: {original.Text}");
+            if (translatedById.TryGetValue(original.Id, out var translated))
+            {
+                sb.AppendLine($"訳文: {translated.Text}");
+            }
             sb.AppendLine();
         }
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }
 
-    /// <summary>訳文のみをSRT字幕として書き出す。
-    /// 各セグメントの正確な発話時間は保持していないため、1行あたり固定で数秒間表示する
-    /// 簡易的なタイミングになる(動画に正確に同期させたい場合は目安として使う想定)</summary>
+    /// <summary>
+    /// 訳文をSRT字幕として書き出す。以前は各セグメントの正確な発話時間を保持していなかったため、
+    /// 1行あたり固定4秒という実際の発話とは無関係な簡易タイミングになっていた。
+    /// 現在はAudioPipelineがWhisperの認識結果(result.Start/End)から算出した実際の発話区間
+    /// (_segmentTimesById)を保持しているため、それを使って実時間に沿ったタイムスタンプを出力する。
+    /// 翻訳が失敗した行(訳文が無い行)はSRTには含めない(字幕として意味を持たないため)。
+    /// </summary>
     private void ExportAsSrt(string path)
     {
-        const int secondsPerLine = 4;
         var sb = new StringBuilder();
-        for (int i = 0; i < TranslatedListBox.Items.Count; i++)
+        int index = 1;
+        foreach (TranscriptLine line in TranslatedListBox.Items)
         {
-            var line = (TranscriptLine)TranslatedListBox.Items[i];
-            var start = TimeSpan.FromSeconds(i * secondsPerLine);
-            var end = TimeSpan.FromSeconds((i + 1) * secondsPerLine);
+            if (!_segmentTimesById.TryGetValue(line.Id, out var times)) continue;
+            // 翻訳中/翻訳失敗のプレースホルダーはSRTに含めない
+            if (line.Text == "(翻訳中…)" || line.Text == "(翻訳失敗)") continue;
 
-            sb.AppendLine((i + 1).ToString());
-            sb.AppendLine($"{start:hh\\:mm\\:ss\\,fff} --> {end:hh\\:mm\\:ss\\,fff}");
+            sb.AppendLine(index.ToString());
+            sb.AppendLine($"{times.Start:hh\\:mm\\:ss\\,fff} --> {times.End:hh\\:mm\\:ss\\,fff}");
             sb.AppendLine(line.Text);
             sb.AppendLine();
+            index++;
         }
         File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
     }

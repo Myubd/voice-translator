@@ -180,7 +180,13 @@ public class OllamaTranslationService : ITranslationService
             var extracted = doc.RootElement.GetProperty("response").GetString()?.Trim();
 
             // 暴走防止のため、万一異常に長い応答が返ってきた場合は安全のため使わない
-            _glossary = (!string.IsNullOrWhiteSpace(extracted) && extracted.Length < 3000) ? extracted : null;
+            if (string.IsNullOrWhiteSpace(extracted) || extracted.Length >= 3000)
+            {
+                _glossary = null;
+                return;
+            }
+
+            _glossary = BuildValidatedGlossary(extracted);
         }
         catch (Exception ex)
         {
@@ -189,6 +195,46 @@ public class OllamaTranslationService : ITranslationService
             Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。用語集無しで続行します。", ex);
             _glossary = null;
         }
+    }
+
+    // 用語集1エントリあたりの原文/訳語の妥当な最大文字数。固有名詞・短いフレーズを想定した値で、
+    // これを超える行はLLMが指示を無視して長文を書いてしまった(=用語集として不適切)とみなして除外する。
+    private const int MaxGlossaryTermLength = 60;
+
+    /// <summary>
+    /// Ollamaから返ってきた生の用語集テキストを1行ずつ検証し、"original => translation" 形式の
+    /// 妥当な行だけを残す。以前は長さ上限(3000文字)のチェックのみで、フォーマットを守っていない行・
+    /// 空の原文/訳語・異常に長い値・重複した原文がそのままプロンプトに混入する可能性があった。
+    /// 不正な行が混じると、翻訳プロンプト内で用語集として正しく解釈されずハルシネーションの
+    /// 原因になりうるため、ここで厳格に検証・除外する。
+    /// </summary>
+    private static string? BuildValidatedGlossary(string rawText)
+    {
+        var seenOriginals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var validLines = new List<string>();
+
+        foreach (var rawLine in rawText.Split('\n'))
+        {
+            var line = rawLine.Trim().TrimEnd('\r');
+            if (line.Length == 0) continue;
+
+            // "original => translation" 形式のみ許可する。矢印が無い・複数ある行は不正とみなす
+            var parts = line.Split("=>", 2, StringSplitOptions.None);
+            if (parts.Length != 2) continue;
+
+            var original = parts[0].Trim();
+            var translation = parts[1].Trim();
+
+            if (original.Length == 0 || translation.Length == 0) continue;
+            if (original.Length > MaxGlossaryTermLength || translation.Length > MaxGlossaryTermLength) continue;
+
+            // 同じ原文が複数回抽出された場合は最初の1件のみ採用する(重複除去)
+            if (!seenOriginals.Add(original)) continue;
+
+            validLines.Add($"{original} => {translation}");
+        }
+
+        return validLines.Count > 0 ? string.Join("\n", validLines) : null;
     }
 
     /// <summary>
