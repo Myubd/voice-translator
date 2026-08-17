@@ -167,12 +167,15 @@ public class AudioPipeline : IDisposable
 
     private readonly object _dedupLock = new object();
     private string? _lastGlobalText;
-    // 重複除去の基準時刻。以前はDateTime.Nowを使っていたため、システム時刻の変更(NTP補正・
-    // サマータイム・手動変更等)の影響を受ける可能性があった。_pipelineClock(Stopwatch)は
-    // OS起動からの単調増加時間を基準にしており、システム時刻の影響を受けないため
-    // こちらに統一する。nullは「まだ一度も記録していない」ことを表す
-    // (TimeSpan.MinValueだと、_pipelineClock.Elapsedとの差分計算でオーバーフローしうるため使わない)。
-    private TimeSpan? _lastGlobalTime = null;
+    // 直前に受理(重複ではないと判定)された発話の、実際の音声時間範囲(絶対時刻)。
+    //
+    // 以前は「文字列完全一致 + 壁時計(_pipelineClock)で3秒以内」を重複除去の条件にしていたが、
+    // これだと「同じ短い発話(例: "Yes.")が数秒後に本当にもう一度行われた」という正当なケースまで
+    // 誤って握りつぶしてしまうことがあった。実際に重複が起きるのは主にWhisperがセグメント境界
+    // (強制15秒分割+300msオーバーラップ)付近で、ほぼ同じ音声区間を2回文字起こしして同じ文を
+    // 出力してしまうケースのため、文字列一致に加えて「実際の音声時間が重なっているか」も
+    // 条件にすることで、時間的に離れた同一文言の別発話を誤除去しないようにする。
+    private (TimeSpan Start, TimeSpan End)? _lastGlobalRange = null;
 
     /// <summary>利用可能な出力(ループバック対象)デバイスの一覧を、OS上で一意なIDと表示名のペアで取得する</summary>
     public static List<AudioDeviceInfo> GetAvailableDevices()
@@ -289,11 +292,12 @@ public class AudioPipeline : IDisposable
         _droppedSegmentCount = 0;
         _droppedTranscriptCount = 0;
         _audioSamplesRead = 0;
-        // 前回セッションの重複除去状態を持ち越さない。_pipelineClockは下でRestart()されるため、
-        // 前回セッションの_lastGlobalTimeが残っていると「新セッション開始直後なのに、
-        // 経過時間の差分がたまたま3秒未満になり誤って重複と判定される」ことがありうる
+        // 前回セッションの重複除去状態を持ち越さない。音声時間は各セッション開始時に0から
+        // 再スタートするため、前回セッションの_lastGlobalRangeが残っていると「新セッション開始
+        // 直後なのに、たまたま音声時間が前回セッション終盤の範囲と重なり誤って重複と判定される」
+        // ことがありうる
         _lastGlobalText = null;
-        _lastGlobalTime = null;
+        _lastGlobalRange = null;
         // _pipelineClockは今回の実行(発話の実時間)を基準にリセットする。そのため、SRTエクスポート等の
         // タイムスタンプは「開始/停止を1回だけ行ったセッション」を前提とした相対時刻になる。
         // 履歴をクリアせずに複数回Start/Stopを繰り返した場合、2回目以降の実行分は
@@ -442,7 +446,7 @@ public class AudioPipeline : IDisposable
             });
 
             var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer, transcriptChannel.Reader);
-            var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader);
+            var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader, cancellationToken);
 
             var readBuffer = new float[ChunkSamples];
             // VADの状態(発話中か、直近の無音チャンク数、プリロールバッファ等)は
@@ -662,8 +666,16 @@ public class AudioPipeline : IDisposable
     /// Whisperが書き出した文字起こし結果を1件ずつ順番に翻訳する。
     /// Whisperワーカーとは別タスクなので、翻訳API(DeepL/Ollama)が遅くても
     /// 音声認識自体はブロックされない。
+    ///
+    /// cancellationTokenはRunAsync全体のキャンセルトークンと同一のもの。停止操作で
+    /// 既にキャンセルされている場合、まだ処理していないキュー内の項目(最大TranscriptChannelCapacity件)は
+    /// 翻訳を試みず即座にスキップする。以前はここでキャンセルを考慮しておらず、停止後も
+    /// キュー内の全項目をDeepL(15秒)/Ollama(30秒)のタイムアウトいっぱいまで律儀に処理し続けており、
+    /// 停止ボタンを押してから実際に終了するまで数十秒〜数分かかることがあった。
+    /// (呼び出し中に停止された場合は、TranslateAsync側にもcancellationTokenを渡しているため、
+    /// タイムアウトを待たずに即座に打ち切られる。)
     /// </summary>
-    private async Task RunTranslationWorkerAsync(ChannelReader<TranscriptItem> reader)
+    private async Task RunTranslationWorkerAsync(ChannelReader<TranscriptItem> reader, CancellationToken cancellationToken)
     {
         while (true)
         {
@@ -694,7 +706,15 @@ public class AudioPipeline : IDisposable
 
             if (_translationService == null) continue;
 
-            var result = await _translationService.TranslateAsync(item!.Text);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // 停止操作で既にキャンセル済み。キューに残っていた項目は翻訳を試みず、
+                // 「処理遅延によりスキップ」と同じ扱いでプレースホルダーを解消する
+                TranscriptItemSkipped?.Invoke(item!.Id);
+                continue;
+            }
+
+            var result = await _translationService.TranslateAsync(item!.Text, cancellationToken);
             var translationCompletedAt = _pipelineClock.Elapsed;
 
             if (result.Text != null)
@@ -810,32 +830,32 @@ public class AudioPipeline : IDisposable
             if (text == lastText) continue;
             lastText = text;
 
+            // Whisperの結果(result.Start/result.End)は、渡した音声チャンク内での相対時刻。
+            // セグメントの実開始時刻(segment.StartTime)を足すことで、パイプライン全体での
+            // 実際の発話時刻(絶対時刻)を得られる。重複除去の時間的重なり判定にも使うため、
+            // ここ(重複判定より前)で計算しておく。
+            var absoluteStart = segment.StartTime + result.Start;
+            var absoluteEnd = segment.StartTime + result.End;
+
             bool isDuplicate;
             lock (_dedupLock)
             {
-                // 完全一致+3秒という重複除去は、Whisperがセグメント境界付近で
-                // 同じ文をほぼ即座に2回出力するケース(プリロールの重なり等)を狙ったものだが、
-                // 窓が長すぎると「Yes.」のような短い発話が数秒後に本当にもう一度発言された
-                // 場合まで誤って握りつぶしてしまう。狙い通りの直近重複だけを除去できるよう
-                // 窓を3秒に短縮している(過去のバグ修正の経緯であり、部分一致方式への変更は
-                // 無関係な文同士がたまたま一部重なって誤除去されるリスクとのトレードオフになるため、
-                // 現状の完全一致方式を維持する)
-                isDuplicate = text == _lastGlobalText && _lastGlobalTime.HasValue
-                    && (_pipelineClock.Elapsed - _lastGlobalTime.Value) < TimeSpan.FromSeconds(3);
+                // 文字列完全一致に加え、実際の音声区間(absoluteStart〜absoluteEnd)が直前に
+                // 受理した発話の音声区間と重なっている場合のみ重複とみなす。
+                // (部分一致方式への変更は、無関係な文同士がたまたま一部重なって誤除去される
+                // リスクとのトレードオフになるため、文字列自体は完全一致方式のまま維持する)
+                bool textMatches = text == _lastGlobalText;
+                bool timeOverlaps = _lastGlobalRange.HasValue
+                    && absoluteStart < _lastGlobalRange.Value.End
+                    && absoluteEnd > _lastGlobalRange.Value.Start;
+                isDuplicate = textMatches && timeOverlaps;
                 if (!isDuplicate)
                 {
                     _lastGlobalText = text;
-                    _lastGlobalTime = _pipelineClock.Elapsed;
+                    _lastGlobalRange = (absoluteStart, absoluteEnd);
                 }
             }
             if (isDuplicate) continue;
-
-            // Whisperの結果(result.Start/result.End)は、渡した音声チャンク内での相対時刻。
-            // セグメントの実開始時刻(segment.StartTime)を足すことで、パイプライン全体での
-            // 実際の発話時刻(絶対時刻)を得られる。これによりSRT出力を「1行固定4秒」という
-            // 目安表示ではなく、実際にその発話が行われた時間で生成できるようにする。
-            var absoluteStart = segment.StartTime + result.Start;
-            var absoluteEnd = segment.StartTime + result.End;
 
             OriginalTextReceived?.Invoke(new OriginalTextEventArgs(segment.Id, text, absoluteStart, absoluteEnd));
 

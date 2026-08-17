@@ -24,7 +24,13 @@ public record TranslationResult(string? Text, string? ErrorMessage)
 /// </summary>
 public interface ITranslationService
 {
-    Task<TranslationResult> TranslateAsync(string text);
+    /// <summary>cancellationTokenはAudioPipeline.RunAsync全体のキャンセルトークンと同一のものが渡される。
+    /// 以前はキャンセル不可だったため、停止ボタンを押しても翻訳待ちキュー(最大8件)+翻訳中の1件を
+    /// DeepL(15秒)/Ollama(30秒)のタイムアウトいっぱいまで律儀に処理してから終了しており、
+    /// 停止から実際の終了までに数十秒〜数分かかることがあった。キャンセルを受け取れるようにし、
+    /// 呼び出し元(AudioPipeline)側でも停止時は未処理分を送信自体行わず即座にスキップすることで、
+    /// 停止操作から実際の終了までの時間を大幅に短縮する。</summary>
+    Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken);
 
     /// <summary>セッション開始時に一度だけ呼ばれる準備処理。既定では何もしない。
     /// cancellationTokenはAudioPipeline.RunAsync全体のキャンセルトークンと同一のものが渡される。
@@ -59,7 +65,7 @@ public class DeepLTranslationService : ITranslationService
     // 呼び出しごとにCancellationTokenSourceで打ち切る形にする。
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
 
-    public async Task<TranslationResult> TranslateAsync(string text)
+    public async Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
     {
         try
         {
@@ -73,7 +79,9 @@ public class DeepLTranslationService : ITranslationService
             request.Headers.Add("Authorization", $"DeepL-Auth-Key {_apiKey}");
             request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
 
-            using var timeoutCts = new CancellationTokenSource(RequestTimeout);
+            // 呼び出しごとのタイムアウトと、外側(停止操作)からのキャンセルの両方でリクエストを打ち切れるようにする
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(RequestTimeout);
             using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
@@ -92,6 +100,12 @@ public class DeepLTranslationService : ITranslationService
             return translated != null
                 ? TranslationResult.Success(translated)
                 : TranslationResult.Failure("DeepLから翻訳結果を取得できませんでした。");
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            // ユーザーが停止操作を行った場合。タイムアウトではないのでログのみに留める
+            Logger.Log("DeepL", "停止操作により翻訳リクエストを中断しました。", ex);
+            return TranslationResult.Failure("停止操作により翻訳を中断しました。");
         }
         catch (OperationCanceledException ex)
         {
@@ -222,12 +236,18 @@ public class OllamaTranslationService : ITranslationService
     // これを超える行はLLMが指示を無視して長文を書いてしまった(=用語集として不適切)とみなして除外する。
     private const int MaxGlossaryTermLength = 60;
 
+    // 用語集の最大エントリ数。文字数上限(3000文字)だけでは、短い用語を大量に生成された場合に
+    // プロンプトが肥大化してしまう(レイテンシ増加・翻訳精度低下の原因になりうる)。
+    // 参考コンテキストから抽出する固有名詞としては現実的に十分な件数として上限を設ける。
+    private const int MaxGlossaryEntries = 80;
+
     /// <summary>
     /// Ollamaから返ってきた生の用語集テキストを1行ずつ検証し、"original => translation" 形式の
     /// 妥当な行だけを残す。以前は長さ上限(3000文字)のチェックのみで、フォーマットを守っていない行・
     /// 空の原文/訳語・異常に長い値・重複した原文がそのままプロンプトに混入する可能性があった。
     /// 不正な行が混じると、翻訳プロンプト内で用語集として正しく解釈されずハルシネーションの
-    /// 原因になりうるため、ここで厳格に検証・除外する。
+    /// 原因になりうるため、ここで厳格に検証・除外する。件数上限(MaxGlossaryEntries)も設け、
+    /// それ以上はプロンプト肥大化を防ぐため切り捨てる。
     /// </summary>
     private static string? BuildValidatedGlossary(string rawText)
     {
@@ -236,6 +256,8 @@ public class OllamaTranslationService : ITranslationService
 
         foreach (var rawLine in rawText.Split('\n'))
         {
+            if (validLines.Count >= MaxGlossaryEntries) break;
+
             var line = rawLine.Trim().TrimEnd('\r');
             if (line.Length == 0) continue;
 
@@ -284,7 +306,7 @@ public class OllamaTranslationService : ITranslationService
     // 無期限に翻訳ワーカーを止めないよう上限は設ける。
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
 
-    public async Task<TranslationResult> TranslateAsync(string text)
+    public async Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
     {
         try
         {
@@ -319,7 +341,9 @@ public class OllamaTranslationService : ITranslationService
             using var request = new HttpRequestMessage(HttpMethod.Post, $"{_endpoint}/api/generate");
             request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
 
-            using var timeoutCts = new CancellationTokenSource(RequestTimeout);
+            // 呼び出しごとのタイムアウトと、外側(停止操作)からのキャンセルの両方でリクエストを打ち切れるようにする
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(RequestTimeout);
             using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
@@ -335,6 +359,12 @@ public class OllamaTranslationService : ITranslationService
             return !string.IsNullOrWhiteSpace(translated)
                 ? TranslationResult.Success(translated!)
                 : TranslationResult.Failure("Ollamaから翻訳結果を取得できませんでした。");
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            // ユーザーが停止操作を行った場合。タイムアウトではないのでログのみに留める
+            Logger.Log("Ollama", "停止操作により翻訳リクエストを中断しました。", ex);
+            return TranslationResult.Failure("停止操作により翻訳を中断しました。");
         }
         catch (OperationCanceledException ex)
         {

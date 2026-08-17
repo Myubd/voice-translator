@@ -387,6 +387,17 @@ public partial class SettingsWindow : Window
 
         Settings.SaveToEnv();
 
+        if (Settings.LastSaveDeepLKeySaveFailed)
+        {
+            // APIキーを安全に(DPAPI暗号化して)保存できなかったため、平文フォールバックはせず
+            // 保存自体を見送っている。他の設定は保存済みなのでダイアログは閉じるが、
+            // ユーザーには気づけるよう明示的に警告する。
+            MessageBox.Show(
+                "DeepL APIキーを安全に保存できませんでした(暗号化に失敗しました)。\n" +
+                "他の設定は保存されましたが、APIキーは変更前の値のままです。",
+                "APIキーの保存に失敗しました", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+
         DialogResult = true;
         Close();
     }

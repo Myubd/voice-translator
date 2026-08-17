@@ -310,14 +310,45 @@ public partial class MainWindow : Window
         }
     }
 
+    // 「停止」がクリックされてから、RunAsync側のバックグラウンド後片付け(Whisper/翻訳ワーカーの
+    // 終了・WASAPIデバイスやWhisperモデルの解放)が完全に終わるまでのあいだtrueになる。
+    //
+    // 以前はここでUIをすぐ「停止中」に戻していたため、後片付けが終わる前に「開始」を
+    // 連打すると、同じAudioPipelineインスタンス上でRunAsyncが2重に実行され、
+    // _processor/_vad/_translationServiceなど共有フィールドが競合する可能性があった
+    // (例: 古いRunAsyncがWhisperProcessorをDisposeした直後に、新しいRunAsyncがそれを使用する等)。
+    // このフラグで「開始」ボタンを完全停止まで無効化することでその競合を防ぐ。
+    private bool _isStopping = false;
+
     private async void StartStopButton_Click(object sender, RoutedEventArgs e)
     {
         if (_isRunning)
         {
+            if (_isStopping) return; // 停止ボタンの多重クリックは無視する
+            _isStopping = true;
+            StartStopButton.IsEnabled = false;
+            StatusText.Text = "停止処理中...";
             _cts?.Cancel();
-            SetRunningUiState(false);
+
+            // ここで_pipelineTaskをawaitすることで、後片付けが完全に終わる(=下の「開始」処理側の
+            // finallyでSetRunningUiState(false)が呼ばれ_isRunningがfalseになる)まで、
+            // このメソッドの呼び出し元(=このクリックハンドラ)は完了しない。
+            // これにより、後片付け中はボタンがdisabledのままとなり、途中で再度「開始」を
+            // 押すことができなくなる。
+            if (_pipelineTask != null)
+            {
+                try { await _pipelineTask; }
+                catch { /* 例外は開始側の処理で既にログ・表示済みのためここでは無視する */ }
+            }
+
+            _isStopping = false;
+            StartStopButton.IsEnabled = true;
             return;
         }
+
+        // 前回の停止処理がまだ完了していない場合は開始させない(通常はボタンがdisabledのため
+        // ここには来ないはずだが、ホットキー経由の呼び出しに備えて念のため二重にガードする)
+        if (_isStopping || _pipelineTask != null) return;
 
         // 設定画面で更新済みの_settingsをそのまま使う(ここで再読み込みすると
         // 設定画面での変更が.envの保存内容次第で上書きされてしまうため)

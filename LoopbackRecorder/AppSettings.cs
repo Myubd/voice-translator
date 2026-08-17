@@ -209,36 +209,44 @@ public class AppSettings
     /// 非Windows環境(開発機など)ではDPAPIが使えないため、平文のまま返す。
     /// </summary>
     /// <summary>
-    /// 暗号化結果。IsEncrypted=falseの場合、Valueは平文であり、DEEPL_API_KEY_ENC(暗号化専用キー)
-    /// ではなく旧形式のDEEPL_API_KEY(平文キー)として保存すべきことを表す。
+    /// 暗号化結果。
+    /// - Encrypted: DPAPIでの暗号化に成功した(通常の状態)
+    /// - PlaintextByDesign: 非Windows環境(開発機など)でDPAPI自体が使えないため、
+    ///   設計として最初から平文運用になっている
+    /// - Failed: Windows環境でDPAPIの暗号化自体に失敗した(異常系)。この場合、
+    ///   Valueは意味を持たない(空文字)。呼び出し側(SaveToEnv)は平文でのフォールバック保存を
+    ///   せず、APIキーの保存自体を見送る。
     ///
-    /// 以前はこの区別が無く、暗号化に失敗しても常にDEEPL_API_KEY_ENCとして保存していたため、
-    /// 次回起動時にDecryptDeepLApiKey()が平文をBase64として復号しようとして必ず失敗し、
-    /// 結果的にAPIキーが空になって消えてしまうバグがあった。
+    /// 以前は暗号化に失敗した場合、常に平文で.envへ書き込んでいた。「設定を失わない」という
+    /// 意味では親切だが、DPAPIを使っている意義(このPC・このWindowsユーザー以外では
+    /// 復号できないようにする)を暗号化失敗時にだけ自ら崩してしまうことになり、セキュリティ上
+    /// 望ましくない。配布アプリとしては「暗号化できない環境では平文保存しない」方が安全なため、
+    /// Failedの場合はAPIキーを保存せず、ユーザーに通知する形に変更した。
     /// </summary>
-    private readonly record struct EncryptResult(string Value, bool IsEncrypted);
+    private enum EncryptStatus { Encrypted, PlaintextByDesign, Failed }
+
+    private readonly record struct EncryptResult(string Value, EncryptStatus Status);
+
+    /// <summary>直前のSaveToEnv()呼び出しで、DPAPI暗号化の失敗によりDeepL APIキーの
+    /// 保存を見送った(=以前の値のまま変更されなかった)場合にtrueになる。
+    /// 呼び出し元のUIはこれを見て、ユーザーに再試行や再入力を促すことができる。</summary>
+    public bool LastSaveDeepLKeySaveFailed { get; private set; }
 
     private static EncryptResult EncryptDeepLApiKey(string plainText)
     {
-        if (string.IsNullOrEmpty(plainText)) return new EncryptResult("", true);
-        if (!OperatingSystem.IsWindows()) return new EncryptResult(plainText, false);
+        if (string.IsNullOrEmpty(plainText)) return new EncryptResult("", EncryptStatus.Encrypted);
+        if (!OperatingSystem.IsWindows()) return new EncryptResult(plainText, EncryptStatus.PlaintextByDesign);
 
         try
         {
             var bytes = Encoding.UTF8.GetBytes(plainText);
             var protectedBytes = ProtectedData.Protect(bytes, DeepLKeyEntropy, DataProtectionScope.CurrentUser);
-            return new EncryptResult(Convert.ToBase64String(protectedBytes), true);
+            return new EncryptResult(Convert.ToBase64String(protectedBytes), EncryptStatus.Encrypted);
         }
         catch (Exception ex)
         {
-            // 暗号化に失敗した場合でも設定の保存自体は止めたくないため、平文でフォールバックする。
-            // ただしIsEncrypted=falseを返すことで、呼び出し側(SaveToEnv)が
-            // DEEPL_API_KEY_ENCではなく旧形式のDEEPL_API_KEYとして保存するようにする
-            // (LoadFromEnv側は元々DEEPL_API_KEY_ENC不在時にDEEPL_API_KEYへフォールバックする
-            // 実装になっているため、次回起動時も正しく読み込め、再度SaveToEnvされれば
-            // 改めて暗号化が試みられる)。
-            Logger.Log("AppSettings", "DeepL APIキーの暗号化に失敗しました。平文で保存します。", ex);
-            return new EncryptResult(plainText, false);
+            Logger.Log("AppSettings", "DeepL APIキーの暗号化に失敗しました。安全に保存できないため、APIキーの保存を見送ります。", ex);
+            return new EncryptResult("", EncryptStatus.Failed);
         }
     }
 
@@ -273,11 +281,32 @@ public class AppSettings
         var escapedPrompt = WhisperPrompt.Replace("\r\n", "\n").Replace("\n", "\\n");
         OllamaEndpoint = NormalizeEndpoint(OllamaEndpoint);
         var encryptResult = EncryptDeepLApiKey(DeepLApiKey);
-        // 暗号化に成功した場合のみDEEPL_API_KEY_ENC(暗号化専用キー)に書く。
-        // 失敗時はDEEPL_API_KEY(平文の旧形式キー)に書くことで、次回起動時に
-        // Base64として誤って復号を試みて失敗し、APIキーが消えてしまう事態を防ぐ。
-        var deepLApiKeyEncLine = encryptResult.IsEncrypted ? $"DEEPL_API_KEY_ENC={encryptResult.Value}" : "DEEPL_API_KEY_ENC=";
-        var deepLApiKeyPlainLine = encryptResult.IsEncrypted ? "DEEPL_API_KEY=" : $"DEEPL_API_KEY={encryptResult.Value}";
+
+        string deepLApiKeyEncLine;
+        string deepLApiKeyPlainLine;
+        LastSaveDeepLKeySaveFailed = false;
+
+        switch (encryptResult.Status)
+        {
+            case EncryptStatus.Encrypted:
+                // 暗号化に成功した場合のみDEEPL_API_KEY_ENC(暗号化専用キー)に書く
+                deepLApiKeyEncLine = $"DEEPL_API_KEY_ENC={encryptResult.Value}";
+                deepLApiKeyPlainLine = "DEEPL_API_KEY=";
+                break;
+            case EncryptStatus.PlaintextByDesign:
+                // 非Windows環境向け。旧形式のDEEPL_API_KEY(平文キー)として保存する
+                deepLApiKeyEncLine = "DEEPL_API_KEY_ENC=";
+                deepLApiKeyPlainLine = $"DEEPL_API_KEY={encryptResult.Value}";
+                break;
+            default: // EncryptStatus.Failed
+                // 暗号化できない環境で平文保存するとDPAPIを使う意義が損なわれるため、
+                // APIキーに関する行は書き換えず、.envに現在残っている値をそのまま維持する
+                // (=ユーザーが今回入力/変更した値は保存されない)。
+                deepLApiKeyEncLine = $"DEEPL_API_KEY_ENC={Environment.GetEnvironmentVariable("DEEPL_API_KEY_ENC") ?? ""}";
+                deepLApiKeyPlainLine = $"DEEPL_API_KEY={Environment.GetEnvironmentVariable("DEEPL_API_KEY") ?? ""}";
+                LastSaveDeepLKeySaveFailed = true;
+                break;
+        }
 
         var lines = new List<string>
         {
@@ -323,7 +352,7 @@ public class AppSettings
             "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)。",
             "# Windows DPAPIで暗号化して保存しているため、このファイルを他PC/他ユーザーへ",
             "# コピーしても復号できない(このPC・このWindowsユーザーでのみ有効)。",
-            "# (万一DPAPIでの暗号化自体に失敗した場合は、下のDEEPL_API_KEYに平文で保存される)",
+            "# (万一DPAPIでの暗号化自体に失敗した場合、安全のためAPIキーは保存されない)",
             deepLApiKeyEncLine,
             deepLApiKeyPlainLine,
             "",
@@ -368,9 +397,15 @@ public class AppSettings
         Environment.SetEnvironmentVariable("TARGET_LANGUAGE_CODE", TargetLanguageCode);
         Environment.SetEnvironmentVariable("TRANSLATION_BACKEND", TranslationBackend);
         // ファイルへの書き込みと同じ理屈で、暗号化成否に応じて正しい方のキーだけに値を設定する
-        // (もう片方は空文字にして、LoadFromEnv側のフォールバック判定と矛盾しないようにする)
-        Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptResult.IsEncrypted ? encryptResult.Value : "");
-        Environment.SetEnvironmentVariable("DEEPL_API_KEY", encryptResult.IsEncrypted ? "" : encryptResult.Value);
+        // (もう片方は空文字にして、LoadFromEnv側のフォールバック判定と矛盾しないようにする)。
+        // Failed時は.envの行を書き換えていないため、実行中プロセスの環境変数も変更しない
+        // (元の値のまま=DeepLApiKeyプロパティに保持されている値と食い違うが、次回LoadFromEnv時に
+        // .envの実際の値から再読込されるため矛盾は解消される)
+        if (encryptResult.Status != EncryptStatus.Failed)
+        {
+            Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptResult.Status == EncryptStatus.Encrypted ? encryptResult.Value : "");
+            Environment.SetEnvironmentVariable("DEEPL_API_KEY", encryptResult.Status == EncryptStatus.Encrypted ? "" : encryptResult.Value);
+        }
         Environment.SetEnvironmentVariable("OLLAMA_MODEL", OllamaModel);
         Environment.SetEnvironmentVariable("OLLAMA_ENDPOINT", OllamaEndpoint);
         Environment.SetEnvironmentVariable("OLLAMA_CONTEXT", escapedContext);

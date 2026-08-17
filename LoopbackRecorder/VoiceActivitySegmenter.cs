@@ -128,7 +128,18 @@ public sealed class VoiceActivitySegmenter
         {
             _speechBuffer.AddRange(chunk.Take(count));
             _silenceChunkCount++;
+        }
 
+        // 無音による自然終了・15秒の強制分割、どちらの判定も発話中は毎チャンク行う。
+        //
+        // 以前は「else if (_inSpeech)」ブロックの中、つまり閾値を下回ったチャンクを処理した
+        // 時にしかこの判定を行っていなかった。そのため、ゲーム音声のように一度もRMSが
+        // 閾値を下回らないまま何十秒も連続する発話(≒常時鳴っている音)では、tooLongの
+        // 判定自体が一度も評価されず、15秒の強制分割が永久に発動しない(_speechBufferが
+        // 際限なく肥大化し続ける)という問題があった。閾値を上回っている間も含め、
+        // 発話中は毎チャンク判定するように変更している。
+        if (_inSpeech)
+        {
             bool silenceLongEnough = _silenceChunkCount >= _silenceChunksToEndSpeech;
             bool tooLong = _speechBuffer.Count / _chunkSamples >= _maxSpeechChunks;
 

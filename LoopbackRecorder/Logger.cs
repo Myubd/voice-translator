@@ -101,9 +101,19 @@ public static class Logger
     /// 継続的に出力し、後から「どこで遅延が発生しているか」を分析できるようにする
     /// (Whisper処理時間・翻訳処理時間・キュー長・drop数・累積遅延などをkey=value形式で残す)。
     /// 呼び出し頻度が高くなりうるため、こちらもLog()同様に例外は握りつぶし、アプリ本体には影響させない。
+    ///
+    /// LogRetentionDaysによる日単位の削除は「翌日以降」にしか効かないため、1日単位のファイルが
+    /// 想定外に長時間(例: 配信中ずっと起動しっぱなし等)書き込まれ続けると、その日のファイル自体が
+    /// 際限なく肥大化しうる。そのため、1ファイルあたりのサイズにも上限を設け、超えた場合は
+    /// (ディスクを圧迫し続けないよう)その日はそれ以上書き込まないようにする。
     /// </summary>
     /// <param name="component">計測対象(例: "Latency", "Queue")</param>
     /// <param name="fields">key=value形式で記録したい値の一覧</param>
+    // 1日分のmetricsログファイルの上限サイズ。通常の利用時間であればまず到達しないが、
+    // 長時間起動しっぱなしでの際限のない肥大化を防ぐための安全弁。
+    private const long MaxMetricsFileSizeBytes = 50L * 1024 * 1024; // 50MB
+    private static string? _metricsSizeLimitWarnedForDate = null;
+
     public static void LogMetric(string component, params (string Key, object Value)[] fields)
     {
         try
@@ -119,11 +129,27 @@ public static class Logger
             }
 
             var line = sb.ToString();
-            var filePath = Path.Combine(LogDirectory, $"metrics-{DateTime.Now:yyyyMMdd}.log");
+            var dateStamp = DateTime.Now.ToString("yyyyMMdd");
+            var filePath = Path.Combine(LogDirectory, $"metrics-{dateStamp}.log");
 
             lock (WriteLock)
             {
                 Directory.CreateDirectory(LogDirectory);
+
+                var fileInfo = new FileInfo(filePath);
+                if (fileInfo.Exists && fileInfo.Length > MaxMetricsFileSizeBytes)
+                {
+                    // 上限到達を知らせる行は、同じ日に何度も書き込んで無駄に消費しないよう1回だけ出す
+                    if (_metricsSizeLimitWarnedForDate != dateStamp)
+                    {
+                        _metricsSizeLimitWarnedForDate = dateStamp;
+                        var warnLine = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}\tLogger\t-\t" +
+                            $"本日分の計測ログが上限({MaxMetricsFileSizeBytes / (1024 * 1024)}MB)に達したため、以降の出力を停止します。";
+                        File.AppendAllText(filePath, warnLine + Environment.NewLine, Encoding.UTF8);
+                    }
+                    return;
+                }
+
                 File.AppendAllText(filePath, line + Environment.NewLine, Encoding.UTF8);
             }
         }

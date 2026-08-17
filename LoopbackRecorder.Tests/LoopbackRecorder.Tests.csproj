@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- 本体(LoopbackRecorder.csproj)はnet8.0-windows/UseWPF=trueだが、テスト対象の
+         VoiceActivitySegmenterはWPF/NAudio/Whisper.netのいずれにも依存しないため、
+         このテストプロジェクトはWPF無しのプレーンなnet8.0にしている。
+         これにより、WPFワークロードが無い環境(CI等)でも `dotnet test` だけで実行できる。 -->
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>LoopbackRecorder.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- テスト対象(VoiceActivitySegmenter)のコンストラクタがSileroVadDetector?型を引数に
+         取るため、コンパイルを通すにはこのパッケージの型情報が必要になる。
+         ただし本テストではSileroVadDetectorのインスタンスは一切生成せず(常にnullを渡し)
+         RMSフォールバック経路のみを検証するため、実行時にONNXモデルファイルやランタイムは
+         不要(ビルド時の参照のみで完結する)。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.29.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- テスト対象の実体は本体プロジェクトのファイルをコピーせずそのままリンク参照する。
+         本体側を修正すればこちらにも自動的に反映され、ファイルが二重管理になって
+         内容がずれる事態を防ぐ。
+         (本体をProjectReferenceで参照しない理由: 本体はUseWPF=trueのnet8.0-windowsのため、
+         ProjectReferenceするとテスト側にもWPF一式の依存が伝播してしまうため)
+         パスは「このcsprojと同じ階層に本体プロジェクトのフォルダ(LoopbackRecorder)がある」
+         構成を想定している。
+         例: Desktop\LoopbackRecorder\LoopbackRecorder.csproj と
+             Desktop\LoopbackRecorder.Tests\LoopbackRecorder.Tests.csproj が
+             同じDesktop直下に並ぶ構成(=LoopbackRecorder.TestsをLoopbackRecorderの
+             "中"に置かない)。本体プロジェクトはSDKスタイルでフォルダ内の.csを再帰的に
+             自動収集するため、LoopbackRecorder.Testsを本体フォルダの中に置くと、本体の
+             ビルドがテストコード側まで誤って取り込んでしまい、ビルドエラーになる。
+         フォルダ構成が異なる場合は、このパスを実際の配置に合わせて書き換えてください。 -->
+    <Compile Include="..\LoopbackRecorder\VoiceActivitySegmenter.cs" Link="SourceUnderTest\VoiceActivitySegmenter.cs" />
+    <Compile Include="..\LoopbackRecorder\SileroVadDetector.cs" Link="SourceUnderTest\SileroVadDetector.cs" />
+  </ItemGroup>
+
+</Project>

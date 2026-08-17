@@ -7,7 +7,7 @@
 ## 主な機能
 
 - WASAPIループバックキャプチャによる音声取得(VB-CABLEやSteelSeries Sonar等の仮想オーディオデバイスに対応)
-- RMSベースの簡易VAD(発話区間検出)。発話開始前の音声を少し遡って付与する「プリロール」機能により語頭の欠落を軽減
+- Silero VAD(発話区間検出)。Sileroモデルが利用できない場合のみRMSベースの簡易VADへ自動フォールバック。発話開始前の音声を少し遡って付与する「プリロール」機能により語頭の欠落を軽減
   - ヒステリシス対応: 発話開始時と発話継続中とで判定閾値を分け、息継ぎ等の短い音量低下によるセグメント分断を抑制(設定画面で調整可能)
 - ゲーム音声優先モード(ON時、VAD閾値を引き上げて小さい雑音より大きい音声を優先的に拾う。倍率は設定画面で調整可能)
 - [Whisper.net](https://github.com/sandrohanea/whisper.net)によるオフライン文字起こし
@@ -60,8 +60,8 @@ copy .env.example .env
 # 音声デバイス名に含まれるキーワード(例: CABLE, Chat)
 DEVICE_KEYWORD=Chat
 
-# VAD(発話検出)の閾値
-VAD_THRESHOLD=0.015
+# VAD(発話検出)の閾値。Silero VADの発話確率(0.0〜1.0)のスケール
+VAD_THRESHOLD=0.5
 
 # VADヒステリシス比率(0〜1)。発話継続中の判定閾値をVAD_THRESHOLDからどれだけ下げるか
 VAD_HYSTERESIS_RATIO=0.6
