@@ -39,12 +39,15 @@
 
 ```powershell
 git clone https://github.com/Myubd/voice-translator.git
-cd voice-translator
+cd voice-translator/LoopbackRecorder
 ```
+
+以降の手順(モデル配置・`.env`作成・ビルド)はすべて、上記の`LoopbackRecorder`フォルダ(`.csproj`と同じ階層)の中で行います。
+(リポジトリ直下には本体プロジェクト`LoopbackRecorder/`と、単体テストプロジェクト`LoopbackRecorder.Tests/`が兄弟フォルダとして並んでおり、アプリ自体のビルド・実行には後者は不要です。)
 
 ### 2. Whisperモデルをダウンロード
 
-[huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)から `ggml-base.bin` をダウンロードし、プロジェクトのルートフォルダ(`.csproj`と同じ階層)に配置してください。
+[huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)から `ggml-base.bin` をダウンロードし、`LoopbackRecorder`フォルダ(`.csproj`と同じ階層)に配置してください。
 
 より高精度な認識が必要な場合は `ggml-small.bin` 等も利用できます(設定画面から切り替え可能)。
 
@@ -163,6 +166,15 @@ Ollamaバックエンド使用時のみ、設定画面の「翻訳」タブに�
 - [NAudio](https://github.com/naudio/NAudio) — 音声キャプチャ・リサンプリング
 - [Whisper.net](https://github.com/sandrohanea/whisper.net) — 音声認識(whisper.cppのC#バインディング)
 - [DeepL API](https://www.deepl.com/pro-api) / [Ollama](https://ollama.com) — 翻訳
+
+## テスト
+
+VAD(発話区間検出)のロジックは`LoopbackRecorder.Tests`(xUnit)で単体テストされています。WPF本体とは別プロジェクトなので、テストの実行にはビルド済みの本体アプリは不要です。
+
+```powershell
+cd LoopbackRecorder.Tests
+dotnet test
+```
 
 ## 既知の制限
 
