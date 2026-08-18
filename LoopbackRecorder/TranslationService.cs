@@ -234,12 +234,15 @@ public class OllamaTranslationService : ITranslationService
 
     // 用語集1エントリあたりの原文/訳語の妥当な最大文字数。固有名詞・短いフレーズを想定した値で、
     // これを超える行はLLMが指示を無視して長文を書いてしまった(=用語集として不適切)とみなして除外する。
-    private const int MaxGlossaryTermLength = 60;
+    // internal: LoopbackRecorder.TestsからBuildValidatedGlossaryの単体テストで参照するため
+    // (テストプロジェクトはこのファイルをCompile Includeで直接コンパイルするので、
+    //  internalのままアクセス可能。InternalsVisibleToは不要)
+    internal const int MaxGlossaryTermLength = 60;
 
     // 用語集の最大エントリ数。文字数上限(3000文字)だけでは、短い用語を大量に生成された場合に
     // プロンプトが肥大化してしまう(レイテンシ増加・翻訳精度低下の原因になりうる)。
     // 参考コンテキストから抽出する固有名詞としては現実的に十分な件数として上限を設ける。
-    private const int MaxGlossaryEntries = 80;
+    internal const int MaxGlossaryEntries = 80;
 
     /// <summary>
     /// Ollamaから返ってきた生の用語集テキストを1行ずつ検証し、"original => translation" 形式の
@@ -249,7 +252,7 @@ public class OllamaTranslationService : ITranslationService
     /// 原因になりうるため、ここで厳格に検証・除外する。件数上限(MaxGlossaryEntries)も設け、
     /// それ以上はプロンプト肥大化を防ぐため切り捨てる。
     /// </summary>
-    private static string? BuildValidatedGlossary(string rawText)
+    internal static string? BuildValidatedGlossary(string rawText)
     {
         var seenOriginals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var validLines = new List<string>();

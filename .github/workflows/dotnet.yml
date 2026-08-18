@@ -1,0 +1,35 @@
+name: .NET Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    # LoopbackRecorder本体はnet8.0-windows/WPFのため、ビルドにはWindowsランナーが必要。
+    # テストプロジェクト(LoopbackRecorder.Tests)はWPF非依存のnet8.0だが、
+    # ソリューション全体を1ジョブでビルド・テストできるようwindows-latestに統一する。
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore (VoiceTranslator)
+        run: dotnet restore LoopbackRecorder/VoiceTranslator.csproj
+
+      - name: Build (VoiceTranslator)
+        run: dotnet build LoopbackRecorder/VoiceTranslator.csproj --no-restore -c Release
+
+      - name: Restore (Tests)
+        run: dotnet restore LoopbackRecorder.Tests/LoopbackRecorder.Tests.csproj
+
+      - name: Test
+        run: dotnet test LoopbackRecorder.Tests/LoopbackRecorder.Tests.csproj --no-restore -c Release --verbosity normal

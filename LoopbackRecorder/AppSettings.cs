@@ -5,13 +5,17 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
-using System.Windows.Input;
 
 /// <summary>
 /// アプリの設定値をまとめて保持するクラス。
 /// .envから読み込み、SettingsWindowでの変更を.envに書き戻せるようにする。
+///
+/// partialにしている理由: ホットキー関連の3メソッド(GetStartStopHotkey/GetOverlayHotkey/
+/// ParseHotkey、AppSettings.Hotkeys.csへ分離)だけがSystem.Windows.Input(WPF)に依存しており、
+/// このファイル自体はWPF非依存にしておくことで、LoopbackRecorder.Tests(WPF無しのnet8.0)から
+/// VoiceActivitySegmenter.csと同じ方式(Compile Includeでの直接コンパイル)でテストできるようにする。
 /// </summary>
-public class AppSettings
+public partial class AppSettings
 {
     public string DeviceKeyword { get; set; } = "Chat";
 
@@ -66,20 +70,6 @@ public class AppSettings
     public string OverlayHotkeyModifiers { get; set; } = "Control, Alt";
     public string OverlayHotkeyKey { get; set; } = "O";
 
-    /// <summary>「翻訳開始/停止」に割り当てられたショートカットキーを取得する。値が不正な場合は既定値(Ctrl+Alt+R)を返す</summary>
-    public (ModifierKeys Modifiers, Key Key) GetStartStopHotkey() =>
-        ParseHotkey(StartStopHotkeyModifiers, StartStopHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.R);
-
-    /// <summary>「オーバーレイ表示切り替え」に割り当てられたショートカットキーを取得する。値が不正な場合は既定値(Ctrl+Alt+O)を返す</summary>
-    public (ModifierKeys Modifiers, Key Key) GetOverlayHotkey() =>
-        ParseHotkey(OverlayHotkeyModifiers, OverlayHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.O);
-
-    private static (ModifierKeys, Key) ParseHotkey(string modifiersStr, string keyStr, ModifierKeys defaultModifiers, Key defaultKey)
-    {
-        var modifiers = Enum.TryParse<ModifierKeys>(modifiersStr, ignoreCase: true, out var parsedModifiers) ? parsedModifiers : defaultModifiers;
-        var key = Enum.TryParse<Key>(keyStr, ignoreCase: true, out var parsedKey) ? parsedKey : defaultKey;
-        return (modifiers, key);
-    }
 
     // exeがどのディレクトリから起動されても同じ.envを見つけられるよう、Whisperモデルパスや
     // ログと同じくAppContext.BaseDirectory基準で解決する。以前はカレントディレクトリ基準("./.env")
@@ -93,9 +83,15 @@ public class AppSettings
     // 同じPC以外では復号できない」形にする。
     private static readonly byte[] DeepLKeyEntropy = Encoding.UTF8.GetBytes("LoopbackRecorder.DeepLApiKey.v1");
 
-    public static AppSettings LoadFromEnv()
+    /// <summary>
+    /// .envから設定を読み込む。
+    /// </summary>
+    /// <param name="envPath">読み込む.envファイルのパス。省略時は既定の<see cref="EnvPath"/>
+    /// (実行ファイルと同じフォルダ)を使う。単体テストから一時ファイルを指定できるように
+    /// するための引数で、通常の呼び出し(引数省略)では従来と動作は変わらない。</param>
+    public static AppSettings LoadFromEnv(string? envPath = null)
     {
-        EnvLoader.Load(EnvPath);
+        EnvLoader.Load(envPath ?? EnvPath);
 
         var settings = new AppSettings
         {
@@ -272,7 +268,13 @@ public class AppSettings
     }
 
     /// <summary>現在の設定を.envファイルに書き戻す(キー以外の項目も含めて保存する)</summary>
-    public void SaveToEnv()
+    /// <summary>
+    /// 現在の設定を.envへ保存する(プロセスの環境変数も合わせて更新する)。
+    /// </summary>
+    /// <param name="envPath">書き込む.envファイルのパス。省略時は既定の<see cref="EnvPath"/>
+    /// (実行ファイルと同じフォルダ)を使う。単体テストから一時ファイルを指定できるように
+    /// するための引数で、通常の呼び出し(引数省略)では従来と動作は変わらない。</param>
+    public void SaveToEnv(string? envPath = null)
     {
         // .envは1行=1設定の形式なので、複数行になりうる値は改行をエスケープする。
         // WHISPER_PROMPTはUIのTextBox自体はAcceptsReturn=Falseだが、貼り付けで
@@ -377,9 +379,10 @@ public class AppSettings
         // Encoding.UTF8は既定でBOM付きになるため、明示的にBOM無しUTF-8を指定する
         // (このアプリはWindows専用でありBOM有無で読み込みに支障は無いが、他ツールで
         // .envを直接編集/diffする際にBOMが混入していると扱いにくいため)
-        var tempPath = EnvPath + ".tmp";
+        var targetPath = envPath ?? EnvPath;
+        var tempPath = targetPath + ".tmp";
         File.WriteAllLines(tempPath, lines, new UTF8Encoding(false));
-        File.Move(tempPath, EnvPath, overwrite: true);
+        File.Move(tempPath, targetPath, overwrite: true);
 
         // 実行中のプロセスにもすぐ反映されるよう環境変数も更新する
         Environment.SetEnvironmentVariable("DEVICE_KEYWORD", DeviceKeyword);

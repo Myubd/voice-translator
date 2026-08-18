@@ -22,6 +22,8 @@
          RMSフォールバック経路のみを検証するため、実行時にONNXモデルファイルやランタイムは
          不要(ビルド時の参照のみで完結する)。 -->
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.29.0" />
+    <!-- AppSettings.cs(DeepL APIキーのDPAPI暗号化)のコンパイルに必要 -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -41,6 +43,30 @@
          フォルダ構成が異なる場合は、このパスを実際の配置に合わせて書き換えてください。 -->
     <Compile Include="..\LoopbackRecorder\VoiceActivitySegmenter.cs" Link="SourceUnderTest\VoiceActivitySegmenter.cs" />
     <Compile Include="..\LoopbackRecorder\SileroVadDetector.cs" Link="SourceUnderTest\SileroVadDetector.cs" />
+    <!-- TranslationService.cs(BuildValidatedGlossaryの単体テスト用)。
+         HttpClientを使うDeepL/Ollama通信部分自体はモックが必要になるため今回はテスト対象外。
+         BuildValidatedGlossaryは外部通信もWPF依存も無い純粋なロジックなので、
+         VoiceActivitySegmenterと同じ方式(直接コンパイル)でテストできる。 -->
+    <Compile Include="..\LoopbackRecorder\TranslationService.cs" Link="SourceUnderTest\TranslationService.cs" />
+    <!-- AppSettings.cs(.envの読み書き・クランプ処理)の単体テスト用。
+         AppSettings.Hotkeys.cs(WPF依存のホットキー解析部分)はpartial分割してあり、
+         テスト側では意図的にIncludeしない(WPF無しでこのプロジェクトをビルドできるようにするため)。
+         AppSettingsはLogger/EnvLoader/Languages.cs(LanguageCatalog)に依存するため、
+         その3つも合わせて取り込む(Languages.csの取り込み漏れが原因のビルドエラーが
+         一度発生したため、依存関係は明示的にコメントしておく)。 -->
+    <Compile Include="..\LoopbackRecorder\AppSettings.cs" Link="SourceUnderTest\AppSettings.cs" />
+    <Compile Include="..\LoopbackRecorder\Logger.cs" Link="SourceUnderTest\Logger.cs" />
+    <Compile Include="..\LoopbackRecorder\EnvLoader.cs" Link="SourceUnderTest\EnvLoader.cs" />
+    <Compile Include="..\LoopbackRecorder\Languages.cs" Link="SourceUnderTest\Languages.cs" />
+    <!-- LatencyTracker.cs(遅延計算ロジック)のテスト用。PipelineModels.cs(TranscriptItem/
+         LatencyMeasurementの定義)も合わせて取り込む(Logger.csは上で取り込み済み)。 -->
+    <Compile Include="..\LoopbackRecorder\LatencyTracker.cs" Link="SourceUnderTest\LatencyTracker.cs" />
+    <Compile Include="..\LoopbackRecorder\PipelineModels.cs" Link="SourceUnderTest\PipelineModels.cs" />
+    <!-- SegmentDeduplicator.cs(重複除去ロジック)のテスト用。外部依存なし。 -->
+    <Compile Include="..\LoopbackRecorder\SegmentDeduplicator.cs" Link="SourceUnderTest\SegmentDeduplicator.cs" />
+    <!-- TranslationWorker.cs(翻訳ワーカーループ)のテスト用。ITranslationServiceは
+         TranslationService.cs(上で取り込み済み)で定義されているため追加のIncludeは不要。 -->
+    <Compile Include="..\LoopbackRecorder\TranslationWorker.cs" Link="SourceUnderTest\TranslationWorker.cs" />
   </ItemGroup>
 
 </Project>

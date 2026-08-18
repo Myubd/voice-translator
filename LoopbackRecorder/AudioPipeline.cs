@@ -124,6 +124,9 @@ public class AudioPipeline : IDisposable
     /// </summary>
     public event Action<LatencyMeasurement>? LatencyMeasured;
 
+    // 遅延計算(Whisper所要時間・翻訳所要時間・累積遅延)は責務分割の第一歩としてLatencyTrackerへ切り出した。
+    private readonly LatencyTracker _latencyTracker = new();
+
     private int _droppedSegmentCount = 0;
     private int _droppedTranscriptCount = 0;
     private long _nextSegmentId = 0;
@@ -165,17 +168,8 @@ public class AudioPipeline : IDisposable
     private SileroVadDetector? _sileroDetector;
     private bool _sileroDetectorLoadAttempted = false;
 
-    private readonly object _dedupLock = new object();
-    private string? _lastGlobalText;
-    // 直前に受理(重複ではないと判定)された発話の、実際の音声時間範囲(絶対時刻)。
-    //
-    // 以前は「文字列完全一致 + 壁時計(_pipelineClock)で3秒以内」を重複除去の条件にしていたが、
-    // これだと「同じ短い発話(例: "Yes.")が数秒後に本当にもう一度行われた」という正当なケースまで
-    // 誤って握りつぶしてしまうことがあった。実際に重複が起きるのは主にWhisperがセグメント境界
-    // (強制15秒分割+300msオーバーラップ)付近で、ほぼ同じ音声区間を2回文字起こしして同じ文を
-    // 出力してしまうケースのため、文字列一致に加えて「実際の音声時間が重なっているか」も
-    // 条件にすることで、時間的に離れた同一文言の別発話を誤除去しないようにする。
-    private (TimeSpan Start, TimeSpan End)? _lastGlobalRange = null;
+    // Whisper結果の重複除去は責務分割の2つ目としてSegmentDeduplicatorへ切り出した。
+    private readonly SegmentDeduplicator _deduplicator = new();
 
     /// <summary>利用可能な出力(ループバック対象)デバイスの一覧を、OS上で一意なIDと表示名のペアで取得する</summary>
     public static List<AudioDeviceInfo> GetAvailableDevices()
@@ -292,12 +286,8 @@ public class AudioPipeline : IDisposable
         _droppedSegmentCount = 0;
         _droppedTranscriptCount = 0;
         _audioSamplesRead = 0;
-        // 前回セッションの重複除去状態を持ち越さない。音声時間は各セッション開始時に0から
-        // 再スタートするため、前回セッションの_lastGlobalRangeが残っていると「新セッション開始
-        // 直後なのに、たまたま音声時間が前回セッション終盤の範囲と重なり誤って重複と判定される」
-        // ことがありうる
-        _lastGlobalText = null;
-        _lastGlobalRange = null;
+        // 前回セッションの重複除去状態を持ち越さない(詳細はSegmentDeduplicator.Resetのコメント参照)
+        _deduplicator.Reset();
         // _pipelineClockは今回の実行(発話の実時間)を基準にリセットする。そのため、SRTエクスポート等の
         // タイムスタンプは「開始/停止を1回だけ行ったセッション」を前提とした相対時刻になる。
         // 履歴をクリアせずに複数回Start/Stopを繰り返した場合、2回目以降の実行分は
@@ -434,7 +424,7 @@ public class AudioPipeline : IDisposable
             // 以前は無制限(Unbounded)だったが、翻訳APIが継続的に遅延する状況が続くと
             // 際限なく溜まり続けてしまうため、音声セグメント側と同様に上限+DropOldest
             // (=最新の発話を優先し、古いものから捨てる)を設ける。
-            // SingleReader=falseにしているのは、通常の消費(RunTranslationWorkerAsync)に加えて
+            // SingleReader=falseにしているのは、通常の消費(TranslationWorker.RunAsync)に加えて
             // WriteTranscriptItem内の破棄処理(満杯時の読み捨て)も別スレッド(Whisperワーカー側)から
             // 同じreaderに対してTryReadを呼ぶため。ここをtrueにすると「単一リーダー」の前提が
             // 崩れ、Channelの内部実装によっては不正な動作を招く可能性がある。
@@ -446,7 +436,13 @@ public class AudioPipeline : IDisposable
             });
 
             var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer, transcriptChannel.Reader);
-            var translationWorkerTask = RunTranslationWorkerAsync(transcriptChannel.Reader, cancellationToken);
+            // 翻訳ワーカーの本体はTranslationWorkerへ切り出した。イベントは自身のpublicイベントへ中継する。
+            var translationWorker = new TranslationWorker(transcriptChannel.Reader, _transcriptQueueLock, _translationService, _pipelineClock, _latencyTracker);
+            translationWorker.TranscriptItemSkipped += id => TranscriptItemSkipped?.Invoke(id);
+            translationWorker.TranslatedTextReceived += args => TranslatedTextReceived?.Invoke(args);
+            translationWorker.TranslationErrorOccurred += msg => TranslationErrorOccurred?.Invoke(msg);
+            translationWorker.LatencyMeasured += m => LatencyMeasured?.Invoke(m);
+            var translationWorkerTask = translationWorker.RunAsync(cancellationToken);
 
             var readBuffer = new float[ChunkSamples];
             // VADの状態(発話中か、直近の無音チャンク数、プリロールバッファ等)は
@@ -675,79 +671,7 @@ public class AudioPipeline : IDisposable
     /// (呼び出し中に停止された場合は、TranslateAsync側にもcancellationTokenを渡しているため、
     /// タイムアウトを待たずに即座に打ち切られる。)
     /// </summary>
-    private async Task RunTranslationWorkerAsync(ChannelReader<TranscriptItem> reader, CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            // WriteTranscriptItem側のdrop判定と同じ_transcriptQueueLockの下でTryReadすることで、
-            // producer(WriteTranscriptItem)とconsumer(このワーカー)間の競合を無くし、
-            // drop数を正確に計測できるようにする(WriteSegment/RunWhisperWorkerAsyncと同じ設計)。
-            TranscriptItem? item;
-            bool got;
-            lock (_transcriptQueueLock)
-            {
-                got = reader.TryRead(out item);
-            }
-
-            if (!got)
-            {
-                bool more;
-                try
-                {
-                    more = await reader.WaitToReadAsync(CancellationToken.None);
-                }
-                catch
-                {
-                    break;
-                }
-                if (!more) break;
-                continue;
-            }
-
-            if (_translationService == null) continue;
-
-            if (cancellationToken.IsCancellationRequested)
-            {
-                // 停止操作で既にキャンセル済み。キューに残っていた項目は翻訳を試みず、
-                // 「処理遅延によりスキップ」と同じ扱いでプレースホルダーを解消する
-                TranscriptItemSkipped?.Invoke(item!.Id);
-                continue;
-            }
-
-            var result = await _translationService.TranslateAsync(item!.Text, cancellationToken);
-            var translationCompletedAt = _pipelineClock.Elapsed;
-
-            if (result.Text != null)
-            {
-                TranslatedTextReceived?.Invoke(new TranslatedTextEventArgs(item.Id, result.Text, item.SegmentStartTime, item.SegmentEndTime));
-            }
-            else if (result.ErrorMessage != null)
-            {
-                // DeepL/Ollamaのエラーはこれまでコンソールに出すだけでUIに一切出ていなかった。
-                // WPFアプリとして配布した場合、通常ユーザーはコンソールを見ないため、
-                // 「なぜか訳文が出ない」状態のまま気づけなかった。ここでStatusへ通知する。
-                TranslationErrorOccurred?.Invoke(result.ErrorMessage);
-
-                // 失敗時もIdだけを載せてイベントを発火させる(Text=null)。
-                // これによりUI側は「この区間は翻訳に失敗した」とIdで認識でき、
-                // 訳文側リストにプレースホルダーを表示することで原文/訳文の対応がズレるのを防げる。
-                TranslatedTextReceived?.Invoke(new TranslatedTextEventArgs(item.Id, null, item.SegmentStartTime, item.SegmentEndTime));
-            }
-
-            // 遅延計測: 発話終了(SegmentEndTime)を基準に、Whisper完了までの時間・
-            // 翻訳完了までの時間・トータルの遅延を算出して通知する
-            var whisperDuration = item.WhisperCompletedAt - item.SegmentEndTime;
-            var translationDuration = translationCompletedAt - item.WhisperCompletedAt;
-            var totalLag = translationCompletedAt - item.SegmentEndTime;
-            var measurement = new LatencyMeasurement(item.Id, whisperDuration, translationDuration, totalLag);
-            LatencyMeasured?.Invoke(measurement);
-            Logger.LogMetric("Latency",
-                ("id", item.Id),
-                ("whisper_ms", (int)whisperDuration.TotalMilliseconds),
-                ("translation_ms", (int)translationDuration.TotalMilliseconds),
-                ("total_lag_ms", (int)totalLag.TotalMilliseconds));
-        }
-    }
+    // 翻訳ワーカーの本体はTranslationWorker.RunAsyncへ移動した(呼び出し箇所はRunAsync内を参照)
 
     /// <summary>
     /// 音声セグメントをキューへ書き込む。
@@ -837,25 +761,8 @@ public class AudioPipeline : IDisposable
             var absoluteStart = segment.StartTime + result.Start;
             var absoluteEnd = segment.StartTime + result.End;
 
-            bool isDuplicate;
-            lock (_dedupLock)
-            {
-                // 文字列完全一致に加え、実際の音声区間(absoluteStart〜absoluteEnd)が直前に
-                // 受理した発話の音声区間と重なっている場合のみ重複とみなす。
-                // (部分一致方式への変更は、無関係な文同士がたまたま一部重なって誤除去される
-                // リスクとのトレードオフになるため、文字列自体は完全一致方式のまま維持する)
-                bool textMatches = text == _lastGlobalText;
-                bool timeOverlaps = _lastGlobalRange.HasValue
-                    && absoluteStart < _lastGlobalRange.Value.End
-                    && absoluteEnd > _lastGlobalRange.Value.Start;
-                isDuplicate = textMatches && timeOverlaps;
-                if (!isDuplicate)
-                {
-                    _lastGlobalText = text;
-                    _lastGlobalRange = (absoluteStart, absoluteEnd);
-                }
-            }
-            if (isDuplicate) continue;
+            // 重複判定はSegmentDeduplicatorに委譲(判定ロジック・ロックの詳細はそちら参照)
+            if (_deduplicator.IsDuplicate(text, absoluteStart, absoluteEnd)) continue;
 
             OriginalTextReceived?.Invoke(new OriginalTextEventArgs(segment.Id, text, absoluteStart, absoluteEnd));
 
