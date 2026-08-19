@@ -194,8 +194,19 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() =>
             {
-                LatencyText.Text = $"遅延: {measurement.TotalLag.TotalSeconds:0.0}秒" +
-                    $" (認識 {measurement.WhisperDuration.TotalSeconds:0.0}s / 翻訳 {measurement.TranslationDuration.TotalSeconds:0.0}s)";
+                _lastLatencyMeasurement = measurement;
+                UpdateLatencyText();
+            });
+        };
+
+        // LatencyMeasuredと対になる、キューの滞留件数(診断情報)。
+        // 「遅延は大きいが1件だけ重い」のか「キュー自体が詰まっている」のかを見分けられるようにする。
+        _pipeline.QueueStatusChanged += status =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                _lastQueueStatus = status;
+                UpdateLatencyText();
             });
         };
 
@@ -206,6 +217,33 @@ public partial class MainWindow : Window
     private int _segmentDropCount = 0;
     private int _transcriptDropCount = 0;
     private long _audioOverflowBytes = 0;
+    private LatencyMeasurement? _lastLatencyMeasurement = null;
+    private PipelineQueueStatus? _lastQueueStatus = null;
+
+    /// <summary>遅延(LatencyMeasured)とキュー滞留件数(QueueStatusChanged)は別々のイベントで
+    /// 届くため、両方を1つの表示にまとめる。片方だけ届いている(起動直後等)場合でも
+    /// 表示が崩れないよう、それぞれnull(未受信)の場合は該当部分を省略する。</summary>
+    private void UpdateLatencyText()
+    {
+        if (_lastLatencyMeasurement == null)
+        {
+            LatencyText.Text = "";
+            return;
+        }
+
+        var m = _lastLatencyMeasurement;
+        var text = $"遅延: {m.TotalLag.TotalSeconds:0.0}秒" +
+            $" (認識 {m.WhisperDuration.TotalSeconds:0.0}s / 翻訳 {m.TranslationDuration.TotalSeconds:0.0}s)";
+
+        // キューが2件以上溜まっている場合のみ表示する(0〜1件は正常範囲であり、常時表示すると
+        // かえって「常に何か詰まっている」ように見えてノイズになるため)
+        if (_lastQueueStatus is { } q && (q.SegmentQueueLength >= 2 || q.TranscriptQueueLength >= 2))
+        {
+            text += $" [待ち行列: 認識待ち{q.SegmentQueueLength}件 / 翻訳待ち{q.TranscriptQueueLength}件]";
+        }
+
+        LatencyText.Text = text;
+    }
 
     /// <summary>音声セグメント破棄・翻訳待ちテキスト破棄・音声バッファoverflow、すべての件数を
     /// 1つの警告表示にまとめる。発生段階(WASAPIバッファ/Whisperキュー/翻訳キュー)が異なるため、
@@ -377,7 +415,7 @@ public partial class MainWindow : Window
             : _settings.VadThreshold;
         _pipeline.HysteresisRatio = _settings.VadHysteresisRatio;
         var translationService = _settings.CreateTranslationService(_httpClient);
-        _translationEnabledForRun = translationService != null;
+        _translationEnabledForRun = translationService.IsEnabled;
         _pipeline.ConfigureTranslation(translationService);
 
         // 今回の実行(セッション)向けの表示状態をリセットする。
@@ -388,6 +426,8 @@ public partial class MainWindow : Window
         _transcriptDropCount = 0;
         _audioOverflowBytes = 0;
         DropCountText.Text = "";
+        _lastLatencyMeasurement = null;
+        _lastQueueStatus = null;
         LatencyText.Text = "";
         _statusErrorClearTimer.Stop();
 
@@ -406,7 +446,7 @@ public partial class MainWindow : Window
 
         try
         {
-            _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _cts.Token);
+            _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _settings.WhisperThreadCount, _cts.Token);
             await _pipelineTask;
         }
         catch (OperationCanceledException)
@@ -441,13 +481,18 @@ public partial class MainWindow : Window
 
     private void SettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        var settingsWindow = new SettingsWindow(_settings, _httpClient);
+        var settingsWindow = new SettingsWindow(_settings, _httpClient, _isRunning);
         if (settingsWindow.ShowDialog() == true)
         {
             _settings = settingsWindow.Settings;
-            _overlayWindow?.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines);
+            _overlayWindow?.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines, _settings.OverlayFontColor);
             // ショートカットキーが変更されている可能性があるため、登録し直す
             RegisterHotkeys();
+
+            if (_isRunning)
+            {
+                StatusText.Text = "設定を保存しました。認識エンジン等の変更を反映するには、一度「翻訳停止」してから「翻訳開始」してください。";
+            }
         }
     }
 
@@ -470,7 +515,7 @@ public partial class MainWindow : Window
         if (_overlayWindow == null || !_overlayWindow.IsVisible)
         {
             _overlayWindow ??= new OverlayWindow();
-            _overlayWindow.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines);
+            _overlayWindow.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines, _settings.OverlayFontColor);
             _overlayWindow.Show();
         }
         else
@@ -513,6 +558,38 @@ public partial class MainWindow : Window
         {
             Logger.Log("MainWindow.Export", "履歴のエクスポートに失敗しました。", ex);
             MessageBox.Show($"エクスポートに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    /// <summary>訳文の履歴をタイムスタンプ付きでクリップボードにコピーする。
+    /// チャットへの貼り付け等、ファイル保存ほど大げさでない共有をワンクリックで行いたい
+    /// というニーズに対応するための機能(ExportAsTextと違いファイルには残さない)。</summary>
+    private void CopyTranslationButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (TranslatedListBox.Items.Count == 0)
+        {
+            StatusText.Text = "コピーする訳文がありません。";
+            return;
+        }
+
+        var sb = new StringBuilder();
+        foreach (TranscriptLine line in TranslatedListBox.Items)
+        {
+            sb.AppendLine(line.Text);
+        }
+
+        try
+        {
+            // Clipboard.SetTextは他プロセス(クリップボード監視ツール等)との競合で
+            // 稀に失敗することがあるため(COMException)、握りつぶさずログに残しつつ
+            // ユーザーにも分かる形でステータス表示する
+            Clipboard.SetText(sb.ToString().TrimEnd());
+            StatusText.Text = "訳文をクリップボードにコピーしました。";
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("MainWindow.CopyTranslation", "訳文のクリップボードへのコピーに失敗しました。", ex);
+            StatusText.Text = "クリップボードへのコピーに失敗しました。";
         }
     }
 

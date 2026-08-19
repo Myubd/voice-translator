@@ -20,10 +20,10 @@ public class AppSettingsTests : IDisposable
 {
     private static readonly string[] EnvKeys =
     {
-        "DEVICE_KEYWORD", "DEVICE_ID", "TRANSLATION_BACKEND", "OLLAMA_MODEL", "OLLAMA_ENDPOINT",
-        "WHISPER_MODEL_PATH", "DEEPL_API_KEY_ENC", "DEEPL_API_KEY",
+        "DEVICE_KEYWORD", "DEVICE_ID", "TRANSLATION_BACKEND", "ENABLE_DEEPL_TO_OLLAMA_FALLBACK", "OLLAMA_MODEL", "OLLAMA_ENDPOINT",
+        "WHISPER_MODEL_PATH", "WHISPER_THREAD_COUNT", "DEEPL_API_KEY_ENC", "DEEPL_API_KEY",
         "VAD_THRESHOLD", "VAD_HYSTERESIS_RATIO", "GAME_AUDIO_PRIORITY_MODE", "GAME_AUDIO_PRIORITY_MULTIPLIER",
-        "OVERLAY_FONT_SIZE", "OVERLAY_OPACITY", "OVERLAY_MAX_LINES",
+        "OVERLAY_FONT_SIZE", "OVERLAY_OPACITY", "OVERLAY_MAX_LINES", "OVERLAY_FONT_COLOR",
         "WHISPER_PROMPT", "RECOGNITION_LANGUAGE", "TARGET_LANGUAGE_CODE", "OLLAMA_CONTEXT",
         "START_STOP_HOTKEY_MODIFIERS", "START_STOP_HOTKEY_KEY", "OVERLAY_HOTKEY_MODIFIERS", "OVERLAY_HOTKEY_KEY",
     };
@@ -132,6 +132,54 @@ public class AppSettingsTests : IDisposable
     }
 
     [Fact]
+    public void オーバーレイ文字色が正しい形式なら読み込まれる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "OVERLAY_FONT_COLOR=#FFE066\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal("#FFE066", settings.OverlayFontColor);
+    }
+
+    [Fact]
+    public void オーバーレイ文字色が不正な形式の場合は既定値の白のまま()
+    {
+        // 手動で.envを編集して壊れた値(#始まりでない、桁数が違う等)が入っていても、
+        // 例外にならず安全に既定値へフォールバックすることを確認する
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "OVERLAY_FONT_COLOR=not-a-color\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal("#FFFFFF", settings.OverlayFontColor);
+    }
+
+    [Fact]
+    public void Whisperスレッド数が範囲外の場合は論理コア数にクランプされる()
+    {
+        var path = CreateTempEnvPath();
+        // 論理コア数を超える極端な値は、実行環境に依存せず必ず上限超過になるよう
+        // Environment.ProcessorCountの2倍を使う
+        File.WriteAllText(path, $"WHISPER_THREAD_COUNT={Environment.ProcessorCount * 2}\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(Environment.ProcessorCount, settings.WhisperThreadCount);
+    }
+
+    [Fact]
+    public void Whisperスレッド数が0以下の場合は下限の1にクランプされる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "WHISPER_THREAD_COUNT=0\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(1, settings.WhisperThreadCount);
+    }
+
+    [Fact]
     public void SaveしてLoadすると基本項目がラウンドトリップする()
     {
         var path = CreateTempEnvPath();
@@ -139,10 +187,13 @@ public class AppSettingsTests : IDisposable
         {
             DeviceKeyword = "TestDevice",
             TranslationBackend = "ollama",
+            EnableDeepLToOllamaFallback = true,
             OllamaModel = "test-model",
             VadThreshold = 0.42f,
             VadHysteresisRatio = 0.33f,
             OverlayMaxLines = 7,
+            OverlayFontColor = "#66D9FF",
+            WhisperThreadCount = 3,
             RecognitionLanguage = "en",
             TargetLanguageCode = "EN-US",
         };
@@ -156,12 +207,96 @@ public class AppSettingsTests : IDisposable
 
         Assert.Equal("TestDevice", reloaded.DeviceKeyword);
         Assert.Equal("ollama", reloaded.TranslationBackend);
+        Assert.True(reloaded.EnableDeepLToOllamaFallback);
         Assert.Equal("test-model", reloaded.OllamaModel);
         Assert.Equal(0.42f, reloaded.VadThreshold);
         Assert.Equal(0.33f, reloaded.VadHysteresisRatio);
         Assert.Equal(7, reloaded.OverlayMaxLines);
+        Assert.Equal("#66D9FF", reloaded.OverlayFontColor);
+        Assert.Equal(3, reloaded.WhisperThreadCount);
         Assert.Equal("en", reloaded.RecognitionLanguage);
         Assert.Equal("EN-US", reloaded.TargetLanguageCode);
+    }
+
+    [Fact]
+    public void DeepL選択でAPIキー未設定の場合はNullTranslationServiceが返る()
+    {
+        var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "" };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.Same(NullTranslationService.Instance, service);
+        Assert.False(service.IsEnabled);
+    }
+
+    [Fact]
+    public void DeepL選択でAPIキー設定済みの場合はDeepLTranslationServiceが返る()
+    {
+        var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "dummy-key:fx" };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.IsType<DeepLTranslationService>(service);
+        Assert.True(service.IsEnabled);
+    }
+
+    [Fact]
+    public void Ollama選択の場合はAPIキー無しでもOllamaTranslationServiceが返る()
+    {
+        var settings = new AppSettings { TranslationBackend = "ollama", DeepLApiKey = "" };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.IsType<OllamaTranslationService>(service);
+        Assert.True(service.IsEnabled);
+    }
+
+    [Fact]
+    public void DeepLフォールバック無効の場合はDeepLTranslationServiceがそのまま返る()
+    {
+        var settings = new AppSettings
+        {
+            TranslationBackend = "deepl",
+            DeepLApiKey = "dummy-key:fx",
+            EnableDeepLToOllamaFallback = false,
+        };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.IsType<DeepLTranslationService>(service);
+    }
+
+    [Fact]
+    public void DeepLフォールバック有効の場合はFallbackTranslationServiceでラップされる()
+    {
+        var settings = new AppSettings
+        {
+            TranslationBackend = "deepl",
+            DeepLApiKey = "dummy-key:fx",
+            EnableDeepLToOllamaFallback = true,
+        };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.IsType<FallbackTranslationService>(service);
+    }
+
+    [Fact]
+    public void フォールバック有効でもAPIキー未設定の場合はNullTranslationServiceが返る()
+    {
+        // フォールバックはDeepL自体が使える(=APIキーがある)ことが前提の機能なので、
+        // キー未設定の場合は従来通りNullTranslationServiceになるべきで、
+        // FallbackTranslationServiceでラップされてはいけない
+        var settings = new AppSettings
+        {
+            TranslationBackend = "deepl",
+            DeepLApiKey = "",
+            EnableDeepLToOllamaFallback = true,
+        };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.Same(NullTranslationService.Instance, service);
     }
 
     [Fact]

@@ -27,7 +27,19 @@ public partial class AppSettings
     public string DeepLApiKey { get; set; } = "";
     public string OllamaModel { get; set; } = "llama3.1";
     public string OllamaEndpoint { get; set; } = "http://localhost:11434";
+
+    /// <summary>trueの場合、DeepL翻訳が失敗した時に自動的にOllamaへフォールバックする。
+    /// TranslationBackend=="deepl"の場合のみ意味を持つ(Ollama選択時はそもそも副が無い)。
+    /// 既定はfalse: Ollama未セットアップの環境でDeepLのみ使っているユーザーに対して、
+    /// 意図せずOllamaへの接続を試みてエラーログが増える等の副作用が出ないようにするため。</summary>
+    public bool EnableDeepLToOllamaFallback { get; set; } = false;
     public string WhisperModelPath { get; set; } = "ggml-base.bin";
+
+    /// <summary>Whisper推論に使うスレッド数。以前はEnvironment.ProcessorCount / 2固定だったが、
+    /// ゲームと同時実行するアプリとしてはCPUコアの半分を占有するのは重すぎる場合があるため、
+    /// 設定画面から調整できるようにした。デフォルトはより控えめなProcessorCount / 4
+    /// (最低2)とし、必要な場合のみユーザーが引き上げられるようにしている。</summary>
+    public int WhisperThreadCount { get; set; } = Math.Max(2, Environment.ProcessorCount / 4);
 
     /// <summary>VAD(発話区間検出)の開始判定閾値。Silero VAD(ONNXニューラルモデル)を
     /// 使う場合は発話確率(0〜1、大きいほど「発話らしい」と判定されにくくなる)のスケール。
@@ -49,6 +61,10 @@ public partial class AppSettings
     public double OverlayFontSize { get; set; } = 22;
     public double OverlayOpacity { get; set; } = 0.7;
     public int OverlayMaxLines { get; set; } = 4;
+
+    /// <summary>オーバーレイの訳文の文字色(#RRGGBB形式)。既定は白。
+    /// ゲーム画面の色味によっては白が見えにくいことがあるため、設定画面からプリセットの中から選べる。</summary>
+    public string OverlayFontColor { get; set; } = "#FFFFFF";
 
     /// <summary>固有名詞などの認識精度を上げるため、Whisperに事前情報として渡すヒント文</summary>
     public string WhisperPrompt { get; set; } = "";
@@ -103,6 +119,15 @@ public partial class AppSettings
             WhisperModelPath = Environment.GetEnvironmentVariable("WHISPER_MODEL_PATH") ?? "ggml-base.bin",
         };
 
+        // 未設定(初回起動・旧バージョンの.env)の場合はコンストラクタ既定値
+        // (Math.Max(2, ProcessorCount / 4))を使う。範囲外の値が.envに直接書かれていた場合は
+        // 1〜論理コア数の範囲にclampする(0以下や極端に大きい値を渡すとWhisper.net側で
+        // 例外になったり、CPUを使い切ってゲーム側のフレームレートを落としたりするため)。
+        if (int.TryParse(Environment.GetEnvironmentVariable("WHISPER_THREAD_COUNT"), out var whisperThreadCount))
+        {
+            settings.WhisperThreadCount = Math.Clamp(whisperThreadCount, 1, Environment.ProcessorCount);
+        }
+
         // DeepL APIキー: DPAPIで暗号化された新形式(DEEPL_API_KEY_ENC)を優先して読み込む。
         // 旧バージョンの平文保存(DEEPL_API_KEY)しか無い場合はそちらを読み込み、
         // 次回SaveToEnv()時に自動的に暗号化形式へ移行される。
@@ -142,6 +167,11 @@ public partial class AppSettings
         {
             settings.GameAudioPriorityMode = priorityMode;
         }
+
+        if (bool.TryParse(Environment.GetEnvironmentVariable("ENABLE_DEEPL_TO_OLLAMA_FALLBACK"), out var fallbackEnabled))
+        {
+            settings.EnableDeepLToOllamaFallback = fallbackEnabled;
+        }
         if (float.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER"),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var priorityMultiplier))
         {
@@ -160,6 +190,14 @@ public partial class AppSettings
         if (int.TryParse(Environment.GetEnvironmentVariable("OVERLAY_MAX_LINES"), out var maxLines))
         {
             settings.OverlayMaxLines = Math.Clamp(maxLines, 1, 10);
+        }
+
+        var overlayFontColor = Environment.GetEnvironmentVariable("OVERLAY_FONT_COLOR");
+        // "#RRGGBB"形式(7文字、#始まり)の場合のみ採用する。壊れた値(手動編集ミス等)が
+        // そのままWPFのColor変換に渡って例外にならないよう、ここで簡易バリデーションしておく
+        if (!string.IsNullOrEmpty(overlayFontColor) && overlayFontColor.Length == 7 && overlayFontColor[0] == '#')
+        {
+            settings.OverlayFontColor = overlayFontColor;
         }
         settings.WhisperPrompt = Environment.GetEnvironmentVariable("WHISPER_PROMPT") ?? "";
         settings.RecognitionLanguage = Environment.GetEnvironmentVariable("RECOGNITION_LANGUAGE") ?? "auto";
@@ -335,9 +373,14 @@ public partial class AppSettings
             $"OVERLAY_FONT_SIZE={OverlayFontSize.ToString(CultureInfo.InvariantCulture)}",
             $"OVERLAY_OPACITY={OverlayOpacity.ToString(CultureInfo.InvariantCulture)}",
             $"OVERLAY_MAX_LINES={OverlayMaxLines}",
+            $"OVERLAY_FONT_COLOR={OverlayFontColor}",
             "",
             "# 使用するWhisperモデルファイル名",
             $"WHISPER_MODEL_PATH={WhisperModelPath}",
+            "",
+            "# Whisper推論に使うスレッド数(1〜論理コア数)。大きいほど文字起こしは速くなるが、",
+            "# ゲームなど他アプリのCPU負荷に影響しやすくなる",
+            $"WHISPER_THREAD_COUNT={WhisperThreadCount}",
             "",
             "# Whisperに渡す認識ヒント(固有名詞など。カンマ区切りで自由に記述。改行は\\nでエスケープ済み)",
             $"WHISPER_PROMPT={escapedPrompt}",
@@ -350,6 +393,10 @@ public partial class AppSettings
             "",
             "# 翻訳バックエンド: \"deepl\" または \"ollama\"",
             $"TRANSLATION_BACKEND={TranslationBackend}",
+            "",
+            "# trueの場合、DeepL翻訳が失敗した時に自動的にOllamaへフォールバックする",
+            "# (TRANSLATION_BACKEND=deeplの場合のみ有効。Ollamaのセットアップが別途必要)",
+            $"ENABLE_DEEPL_TO_OLLAMA_FALLBACK={EnableDeepLToOllamaFallback}",
             "",
             "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)。",
             "# Windows DPAPIで暗号化して保存しているため、このファイルを他PC/他ユーザーへ",
@@ -390,11 +437,14 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("VAD_THRESHOLD", VadThreshold.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("VAD_HYSTERESIS_RATIO", VadHysteresisRatio.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE", GameAudioPriorityMode.ToString());
+        Environment.SetEnvironmentVariable("ENABLE_DEEPL_TO_OLLAMA_FALLBACK", EnableDeepLToOllamaFallback.ToString());
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER", GameAudioPriorityMultiplier.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("OVERLAY_FONT_SIZE", OverlayFontSize.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("OVERLAY_OPACITY", OverlayOpacity.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("OVERLAY_MAX_LINES", OverlayMaxLines.ToString());
+        Environment.SetEnvironmentVariable("OVERLAY_FONT_COLOR", OverlayFontColor);
         Environment.SetEnvironmentVariable("WHISPER_MODEL_PATH", WhisperModelPath);
+        Environment.SetEnvironmentVariable("WHISPER_THREAD_COUNT", WhisperThreadCount.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("WHISPER_PROMPT", WhisperPrompt);
         Environment.SetEnvironmentVariable("RECOGNITION_LANGUAGE", RecognitionLanguage);
         Environment.SetEnvironmentVariable("TARGET_LANGUAGE_CODE", TargetLanguageCode);
@@ -418,7 +468,15 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_KEY", OverlayHotkeyKey);
     }
 
-    public ITranslationService? CreateTranslationService(System.Net.Http.HttpClient httpClient)
+    /// <summary>設定に応じた翻訳サービスを生成する。DeepLでAPIキー未設定の場合は
+    /// (以前はnullを返していたが)NullTranslationService(IsEnabled=false)を返し、
+    /// 呼び出し元がnullチェックをしなくても「翻訳せず文字起こしのみ」を扱えるようにする。
+    ///
+    /// EnableDeepLToOllamaFallback=trueの場合、DeepL選択時はFallbackTranslationServiceで
+    /// 包み、DeepL失敗時に自動的にOllamaへ切り替えられるようにする(OllamaModel/Endpoint等は
+    /// 通常のOllama設定をそのまま流用する。Ollama側が未セットアップでも、実際に使われる
+    /// (=DeepLが失敗する)まではエラーにならない)。</summary>
+    public ITranslationService CreateTranslationService(System.Net.Http.HttpClient httpClient)
     {
         var targetOption = LanguageCatalog.FindByDeepLCode(TargetLanguageCode);
 
@@ -429,9 +487,13 @@ public partial class AppSettings
 
         if (!string.IsNullOrWhiteSpace(DeepLApiKey))
         {
-            return new DeepLTranslationService(httpClient, DeepLApiKey, targetOption.DeepLCode);
+            var deepL = new DeepLTranslationService(httpClient, DeepLApiKey, targetOption.DeepLCode);
+            if (!EnableDeepLToOllamaFallback) return deepL;
+
+            var ollamaFallback = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
+            return new FallbackTranslationService(deepL, ollamaFallback);
         }
 
-        return null;
+        return NullTranslationService.Instance;
     }
 }

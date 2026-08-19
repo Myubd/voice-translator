@@ -124,6 +124,11 @@ public class AudioPipeline : IDisposable
     /// </summary>
     public event Action<LatencyMeasurement>? LatencyMeasured;
 
+    /// <summary>
+    /// LatencyMeasuredと同じタイミングで発火する、2つのキュー(音声セグメント待ち/翻訳待ち)の
+    /// 現在の滞留件数。遅延の原因がキューの詰まりによるものかどうかを切り分けるための診断情報。
+    /// </summary>
+    public event Action<PipelineQueueStatus>? QueueStatusChanged;
     // 遅延計算(Whisper所要時間・翻訳所要時間・累積遅延)は責務分割の第一歩としてLatencyTrackerへ切り出した。
     private readonly LatencyTracker _latencyTracker = new();
 
@@ -153,7 +158,7 @@ public class AudioPipeline : IDisposable
     private long _audioSamplesRead = 0;
 
     private WhisperProcessor? _processor;
-    private ITranslationService? _translationService;
+    private ITranslationService _translationService = NullTranslationService.Instance;
 
     // VAD(発話区間検出)のステートマシン本体。RunAsync開始時に生成し、終了時に破棄する。
     // ロジック自体はVoiceActivitySegmenterクラスに切り出してあり、ここでは生成と
@@ -194,10 +199,12 @@ public class AudioPipeline : IDisposable
 
     public void ConfigureTranslation(ITranslationService? service)
     {
-        _translationService = service;
+        // nullを渡された場合(未設定/APIキー未入力等)はNullTranslationServiceに正規化し、
+        // 以降のパイプライン内部(TranslationWorker等)がnullチェックを持たずに済むようにする
+        _translationService = service ?? NullTranslationService.Instance;
     }
 
-    public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, CancellationToken cancellationToken)
+    public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, int whisperThreadCount, CancellationToken cancellationToken)
     {
         using var enumerator = new MMDeviceEnumerator();
         var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
@@ -266,9 +273,11 @@ public class AudioPipeline : IDisposable
         }
 
         using var whisperFactory = WhisperFactory.FromPath(resolvedModelPath);
+        // 呼び出し元(AppSettings.WhisperThreadCount)で1〜論理コア数にclamp済みだが、
+        // 想定外の値(0以下)が渡された場合に備えて念のためここでも下限を保証しておく
         var processorBuilder = whisperFactory.CreateBuilder()
             .WithLanguage(string.IsNullOrWhiteSpace(recognitionLanguage) ? "auto" : recognitionLanguage)
-            .WithThreads(Math.Max(2, Environment.ProcessorCount / 2)); // CPUコア数に応じてスレッド数を明示指定
+            .WithThreads(Math.Max(1, whisperThreadCount));
 
         if (!string.IsNullOrWhiteSpace(whisperPrompt))
         {
@@ -379,12 +388,13 @@ public class AudioPipeline : IDisposable
                 return;
             }
 
-            // 翻訳サービスの準備処理(Ollama使用時、参考コンテキストからの用語集抽出など)を先に済ませておく。
+            // 翻訳サービスの準備処理(Ollama使用時、モデルの事前ロードや参考コンテキストからの
+            // 用語集抽出など)を先に済ませておく。
             // cancellationTokenを渡すことで、この処理中にユーザーが「停止」した場合も
             // (以前のようにPrepareAsyncの完了/タイムアウトを待たされることなく)即座に打ち切れる。
-            if (_translationService != null)
+            if (_translationService.IsEnabled)
             {
-                StatusChanged?.Invoke("翻訳の準備中(用語集を抽出しています)...");
+                StatusChanged?.Invoke("翻訳エンジンを準備中...");
                 try
                 {
                     await _translationService.PrepareAsync(cancellationToken);
@@ -441,7 +451,14 @@ public class AudioPipeline : IDisposable
             translationWorker.TranscriptItemSkipped += id => TranscriptItemSkipped?.Invoke(id);
             translationWorker.TranslatedTextReceived += args => TranslatedTextReceived?.Invoke(args);
             translationWorker.TranslationErrorOccurred += msg => TranslationErrorOccurred?.Invoke(msg);
-            translationWorker.LatencyMeasured += m => LatencyMeasured?.Invoke(m);
+            translationWorker.LatencyMeasured += m =>
+            {
+                LatencyMeasured?.Invoke(m);
+                // 同じタイミングで2つのキューの滞留件数も通知する。
+                // Channel.Reader.Countは他スレッドから読んでもスレッドセーフ(内部でロック済み)なので、
+                // ここで直接参照して問題ない。
+                QueueStatusChanged?.Invoke(new PipelineQueueStatus(segmentChannel.Reader.Count, transcriptChannel.Reader.Count));
+            };
             var translationWorkerTask = translationWorker.RunAsync(cancellationToken);
 
             var readBuffer = new float[ChunkSamples];

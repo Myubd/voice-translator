@@ -50,3 +50,13 @@ public sealed record LatencyMeasurement(
     TimeSpan WhisperDuration,
     TimeSpan TranslationDuration,
     TimeSpan TotalLag);
+
+/// <summary>
+/// パイプライン内の2つのキュー(音声セグメント→Whisper待ち / 文字起こし結果→翻訳待ち)の
+/// 現在の滞留件数。LatencyMeasuredと同じタイミングで発火することで、
+/// 「遅延の数値は大きいが、キューは詰まっていない(=単に1件が重い)」のか
+/// 「キュー自体が詰まっている(=処理速度が追いついていない)」のかを切り分けられるようにする。
+/// (TODO: 「パイプラインのlatency計測・Observable化」への対応の一部。Capture/VAD段の
+/// 個別タイムスタンプ計測は影響範囲が大きいため、今回はキュー長の可視化のみを対象とした)
+/// </summary>
+public sealed record PipelineQueueStatus(int SegmentQueueLength, int TranscriptQueueLength);

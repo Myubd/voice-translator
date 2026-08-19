@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Navigation;
 
 namespace LoopbackRecorder;
@@ -31,6 +32,21 @@ public partial class SettingsWindow : Window
     // DeepL APIキーはPasswordBox/TextBoxを表示切り替えで共有するため、値そのものはここで一元管理する
     private string _deepLApiKey = "";
 
+    // オーバーレイの文字色プリセット。(表示名, #RRGGBB)。
+    // フルカラーピッカーではなくプリセットに絞っているのは、ゲーム配信中でも視認性が
+    // 確保しやすい色(コントラストが十分な明るい色)だけに選択肢を限定するため。
+    private static readonly (string Name, string Hex)[] OverlayColorPresets =
+    [
+        ("白", "#FFFFFF"),
+        ("黄", "#FFE066"),
+        ("水色", "#66D9FF"),
+        ("緑", "#7CFC8C"),
+        ("ピンク", "#FF8FCB"),
+    ];
+
+    private string _selectedOverlayColor = OverlayColorPresets[0].Hex;
+    private readonly List<Border> _overlayColorSwatches = new();
+
     // ==== ショートカットキーの記録用状態 ====
     // "startstop" / "overlay" / null(記録中でない)
     private string? _recordingHotkeyTarget;
@@ -39,11 +55,17 @@ public partial class SettingsWindow : Window
     private ModifierKeys _overlayModifiers;
     private Key _overlayKey;
 
-    public SettingsWindow(AppSettings currentSettings, HttpClient sharedHttpClient)
+    public SettingsWindow(AppSettings currentSettings, HttpClient sharedHttpClient, bool isRunning = false)
     {
         InitializeComponent();
         Settings = currentSettings;
         _httpClient = sharedHttpClient;
+
+        // 翻訳実行中に設定画面を開いた場合、ここで変更した内容(モデル名・APIキー等)は
+        // 実行中のAudioPipelineには即座に反映されない(次回の「翻訳開始」時に初めて使われる)。
+        // 気づかないまま「設定を変えたのに反映されない」と誤解されるのを防ぐため、
+        // バナーで明示する。
+        RunningWarningBanner.Visibility = isRunning ? Visibility.Visible : Visibility.Collapsed;
 
         // デバイス一覧を読み込む。保存済みのDeviceId(一意なOS識別子)があればそれを優先して選択し、
         // 無ければ従来どおり名前の部分一致にフォールバックする(同名デバイスが複数ある場合の誤選択を避けるため)
@@ -72,6 +94,11 @@ public partial class SettingsWindow : Window
         }
         WhisperModelComboBox.Text = Settings.WhisperModelPath;
 
+        // XAML側は固定のMaximum=16を仮置きしているだけなので、実機の論理コア数に合わせて上書きする
+        // (コア数が16を超えるハイエンド環境でも、逆にコア数が少ない環境でも矛盾しないように)
+        WhisperThreadCountSlider.Maximum = Environment.ProcessorCount;
+        WhisperThreadCountSlider.Value = Math.Clamp(Settings.WhisperThreadCount, 1, Environment.ProcessorCount);
+
         // 認識言語・翻訳先言語のドロップダウンを初期化
         RecognitionLanguageComboBox.ItemsSource = LanguageCatalog.SourceLanguages;
         RecognitionLanguageComboBox.SelectedItem = LanguageCatalog.SourceLanguages
@@ -86,6 +113,7 @@ public partial class SettingsWindow : Window
         DeepLApiKeyPasswordBox.Password = _deepLApiKey;
         OllamaModelComboBox.Text = Settings.OllamaModel;
         OllamaEndpointTextBox.Text = Settings.OllamaEndpoint;
+        DeepLToOllamaFallbackCheckBox.IsChecked = Settings.EnableDeepLToOllamaFallback;
         VadThresholdSlider.Value = Settings.VadThreshold;
         VadHysteresisSlider.Value = Settings.VadHysteresisRatio;
         GameAudioPriorityCheckBox.IsChecked = Settings.GameAudioPriorityMode;
@@ -93,6 +121,7 @@ public partial class SettingsWindow : Window
         OverlayFontSizeSlider.Value = Settings.OverlayFontSize;
         OverlayOpacitySlider.Value = Settings.OverlayOpacity;
         OverlayMaxLinesSlider.Value = Settings.OverlayMaxLines;
+        InitializeOverlayColorSwatches(Settings.OverlayFontColor);
         WhisperPromptTextBox.Text = Settings.WhisperPrompt;
         OllamaContextTextBox.Text = Settings.OllamaContext;
 
@@ -208,13 +237,10 @@ public partial class SettingsWindow : Window
 
     private void BackendComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        // Ollamaモデル一覧の自動取得は、フォールバック用の表示も含めてUpdateBackendPanelsVisibility側で
+        // 一元的に判定する(以前はここにも同じ条件の呼び出しがあり、フォールバック表示との条件が
+        // 二重管理でズレる原因になっていたため統合した)
         UpdateBackendPanelsVisibility();
-
-        bool isOllama = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string == "ollama";
-        if (isOllama && OllamaModelComboBox.Items.Count == 0)
-        {
-            _ = LoadOllamaModelsAsync();
-        }
     }
 
     /// <summary>
@@ -230,17 +256,103 @@ public partial class SettingsWindow : Window
         _ = LoadOllamaModelsAsync();
     }
 
+    /// <summary>「DeepL失敗時にOllamaへフォールバック」の有効/無効切り替え。
+    /// フォールバック先の設定(モデル名・エンドポイント)を入力できるようOllamaPanelの
+    /// 表示状態を更新する。</summary>
+    private void DeepLToOllamaFallbackCheckBox_CheckedChanged(object sender, RoutedEventArgs e)
+    {
+        UpdateBackendPanelsVisibility();
+    }
+
+    /// <summary>オーバーレイの文字色プリセットを、選択可能な色スウォッチ(色付きの小さな正方形)として
+    /// OverlayColorSwatchPanelに動的に生成する。XAMLで5個分を毎回手書きする代わりに、
+    /// OverlayColorPresets配列を単一の情報源にすることで、プリセットの追加/変更が1箇所で済むようにしている。
+    ///
+    /// 以前はToggleButtonをそのまま使っていたが、既定のチェック状態の見た目がColor塗りの背景に
+    /// 埋もれてほとんど分からず、「何を選んでいるか分からない」というフィードバックを受けた。
+    /// Borderで自前描画にし、選択中は太いアクセントカラーの枠+チェックマークを表示することで、
+    /// どの背景色でも確実に視認できるようにしている。</summary>
+    private void InitializeOverlayColorSwatches(string selectedHex)
+    {
+        OverlayColorSwatchPanel.Children.Clear();
+        _overlayColorSwatches.Clear();
+
+        foreach (var preset in OverlayColorPresets)
+        {
+            var color = (Color)ColorConverter.ConvertFromString(preset.Hex);
+
+            var checkmark = new TextBlock
+            {
+                Text = "\uE73E", // Segoe MDL2 Assets: チェックマーク(他のアイコンと同じフォントで統一)
+                FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                FontSize = 14,
+                // スウォッチは白・黄・水色・緑・ピンクいずれも明るい色なので、黒で固定しても
+                // どの色の上でも視認できる
+                Foreground = Brushes.Black,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                Visibility = Visibility.Collapsed,
+            };
+
+            var swatch = new Border
+            {
+                Width = 32,
+                Height = 32,
+                CornerRadius = new CornerRadius(6),
+                Margin = new Thickness(0, 0, 8, 0),
+                Background = new SolidColorBrush(color),
+                Cursor = Cursors.Hand,
+                Tag = preset.Hex,
+                ToolTip = preset.Name,
+                Child = checkmark,
+            };
+            swatch.MouseLeftButtonDown += (_, _) => SelectOverlayColorSwatch(swatch);
+
+            OverlayColorSwatchPanel.Children.Add(swatch);
+            _overlayColorSwatches.Add(swatch);
+        }
+
+        var initiallySelected = _overlayColorSwatches.FirstOrDefault(s =>
+            string.Equals((string)s.Tag, selectedHex, StringComparison.OrdinalIgnoreCase)) ?? _overlayColorSwatches[0];
+        SelectOverlayColorSwatch(initiallySelected);
+    }
+
+    // 選択中のスウォッチの枠線色・太さ(未選択時と区別が確実につくよう、アクセントカラー+太めにしている)
+    private static readonly SolidColorBrush OverlaySwatchSelectedBorder = new(Color.FromRgb(0x29, 0xC7, 0xC1));
+    private static readonly SolidColorBrush OverlaySwatchNormalBorder = new(Color.FromRgb(0x55, 0x55, 0x66));
+
+    private void SelectOverlayColorSwatch(Border selected)
+    {
+        _selectedOverlayColor = (string)selected.Tag;
+
+        foreach (var swatch in _overlayColorSwatches)
+        {
+            bool isSelected = ReferenceEquals(swatch, selected);
+            swatch.BorderBrush = isSelected ? OverlaySwatchSelectedBorder : OverlaySwatchNormalBorder;
+            swatch.BorderThickness = new Thickness(isSelected ? 3 : 1);
+            ((TextBlock)swatch.Child).Visibility = isSelected ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
     private void UpdateBackendPanelsVisibility()
     {
         // XAMLロード中(まだ子要素が無い)は何もしない
-        if (DeepLPanel == null || OllamaPanel == null || OllamaContextPanel == null) return;
+        if (DeepLPanel == null || OllamaPanel == null || DeepLToOllamaFallbackCheckBox == null) return;
 
         bool isOllama = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string == "ollama";
+        // DeepL選択時でも「DeepL失敗時にOllamaへフォールバック」が有効な場合は、
+        // フォールバック先として使うOllamaモデル名/エンドポイント/参考コンテキストを設定できるよう
+        // OllamaPanelを表示する(参考コンテキストはOllamaPanelにネストされているため、
+        // このOllamaPanelの表示/非表示だけで連動して切り替わる)
+        bool showOllamaPanel = isOllama || DeepLToOllamaFallbackCheckBox.IsChecked == true;
+
         DeepLPanel.Visibility = isOllama ? Visibility.Collapsed : Visibility.Visible;
-        OllamaPanel.Visibility = isOllama ? Visibility.Visible : Visibility.Collapsed;
-        // 参考コンテキストは「言語」タブ側にあるが、Ollama使用時のみ意味を持つため
-        // バックエンド選択(エンジンタブ)と連動して表示/非表示を切り替える
-        OllamaContextPanel.Visibility = isOllama ? Visibility.Visible : Visibility.Collapsed;
+        OllamaPanel.Visibility = showOllamaPanel ? Visibility.Visible : Visibility.Collapsed;
+
+        if (showOllamaPanel && OllamaModelComboBox.Items.Count == 0)
+        {
+            _ = LoadOllamaModelsAsync();
+        }
     }
 
     /// <summary>左サイドバーの選択に応じて、右側の表示ページを切り替える</summary>
@@ -365,10 +477,12 @@ public partial class SettingsWindow : Window
             Settings.DeviceKeyword = selectedDevice.Name;
         }
         Settings.WhisperModelPath = WhisperModelComboBox.Text;
+        Settings.WhisperThreadCount = (int)WhisperThreadCountSlider.Value;
         Settings.TranslationBackend = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deepl";
         Settings.DeepLApiKey = _deepLApiKey;
         Settings.OllamaModel = OllamaModelComboBox.Text;
         Settings.OllamaEndpoint = OllamaEndpointTextBox.Text;
+        Settings.EnableDeepLToOllamaFallback = DeepLToOllamaFallbackCheckBox.IsChecked == true;
         Settings.VadThreshold = (float)VadThresholdSlider.Value;
         Settings.VadHysteresisRatio = (float)VadHysteresisSlider.Value;
         Settings.GameAudioPriorityMode = GameAudioPriorityCheckBox.IsChecked == true;
@@ -376,6 +490,7 @@ public partial class SettingsWindow : Window
         Settings.OverlayFontSize = OverlayFontSizeSlider.Value;
         Settings.OverlayOpacity = OverlayOpacitySlider.Value;
         Settings.OverlayMaxLines = (int)OverlayMaxLinesSlider.Value;
+        Settings.OverlayFontColor = _selectedOverlayColor;
         Settings.WhisperPrompt = WhisperPromptTextBox.Text;
         Settings.RecognitionLanguage = (RecognitionLanguageComboBox.SelectedItem as LanguageOption)?.WhisperCode ?? "auto";
         Settings.TargetLanguageCode = (TargetLanguageComboBox.SelectedItem as LanguageOption)?.DeepLCode ?? "JA";

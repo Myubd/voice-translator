@@ -37,6 +37,31 @@ public interface ITranslationService
     /// 以前はキャンセル不可だったため、Ollamaが応答しない間はユーザーが「停止」を押しても
     /// この処理が終わるまで停止できず、「開始したのに止められない」状態になっていた。</summary>
     Task PrepareAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>実際に翻訳を行うサービスかどうか。既定はtrue(実装クラスは変更不要)。
+    /// NullTranslationServiceのみfalseを返し、「翻訳せず文字起こしのみ」のユースケースを
+    /// nullチェックではなくこのプロパティで明示的に判定できるようにする。</summary>
+    bool IsEnabled => true;
+}
+
+/// <summary>
+/// 翻訳サービスが未設定(APIキー未入力など)の場合に使うNullオブジェクト。
+/// 以前はITranslationService?をnullのまま各所(AudioPipeline/TranslationWorker/MainWindow)で
+/// チェックしていたが、チェック漏れのリスクとnull分岐の散在を避けるため、
+/// 「翻訳しない」という振る舞いをこのクラス自身に持たせる。
+/// TranslateAsyncは呼び出し元がIsEnabled==falseの時点で呼ばない前提のため、
+/// 万一呼ばれた場合に備えて安全側(エラー扱い)の結果を返すのみに留める。
+/// </summary>
+public sealed class NullTranslationService : ITranslationService
+{
+    public static readonly NullTranslationService Instance = new();
+
+    private NullTranslationService() { }
+
+    public bool IsEnabled => false;
+
+    public Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+        => Task.FromResult(TranslationResult.Failure("翻訳サービスが設定されていません。"));
 }
 
 /// <summary>
@@ -128,6 +153,78 @@ public class DeepLTranslationService : ITranslationService
 }
 
 /// <summary>
+/// DeepL(主)が失敗した場合に、自動的にOllama(副)へ切り替えて再試行するラッパー。
+/// 「DeepLがタイムアウトした場合に自動でOllamaへ切り替える」というTODO項目への対応。
+///
+/// 設計方針:
+/// - 主(DeepL)が成功した場合は副(Ollama)を一切呼ばない(成功時のレイテンシ・コストに影響しない)
+/// - ユーザーの「停止」操作によるキャンセルの場合はフォールバックしない
+///   (停止したいのに新しいリクエストが飛ぶのは直感に反するため)
+/// - 両方失敗した場合は両方のエラーメッセージを合わせて返す(原因の切り分けをしやすくするため)
+/// - IsEnabledは主側にのみ委譲する(このラッパー自体は「DeepLが設定されている」ことが前提のため)
+/// </summary>
+public sealed class FallbackTranslationService : ITranslationService
+{
+    private readonly ITranslationService _primary;
+    private readonly ITranslationService _fallback;
+
+    public FallbackTranslationService(ITranslationService primary, ITranslationService fallback)
+    {
+        _primary = primary;
+        _fallback = fallback;
+    }
+
+    public bool IsEnabled => _primary.IsEnabled;
+
+    /// <summary>主(DeepL)の準備処理を待ってから、副(Ollama)の準備はバックグラウンドで開始する。
+    ///
+    /// 以前は副側もここでawaitしていたが、Ollama側にモデルの事前ロード処理を追加したことで、
+    /// DeepLだけで問題なく完結するはずのセッションでも、毎回Ollamaのモデルロード待ち
+    /// (最大60秒程度)が「翻訳エンジンを準備中...」の間に発生してしまうようになった。
+    /// フォールバックはあくまで「主が失敗した時の保険」であり、副の準備が遅れて実際に
+    /// フォールバックが必要になった1回だけロード待ちが発生するのは許容範囲だが、
+    /// 毎回のセッション開始が副の都合で遅くなるのは本末転倒なため、awaitせず投げっぱなしにする。
+    /// 失敗時にobserveされない例外でクラッシュしないよう、内部で必ずtry/catchする。</summary>
+    public async Task PrepareAsync(CancellationToken cancellationToken)
+    {
+        await _primary.PrepareAsync(cancellationToken);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _fallback.PrepareAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // ユーザーの「停止」操作、またはセッション終了によるキャンセル。無視してよい
+            }
+            catch (Exception ex)
+            {
+                Logger.Log("TranslationFallback", "フォールバック先(Ollama)のバックグラウンド準備処理に失敗しました。", ex);
+            }
+        }, CancellationToken.None);
+    }
+
+    public async Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+    {
+        var primaryResult = await _primary.TranslateAsync(text, cancellationToken);
+        if (primaryResult.Text != null) return primaryResult;
+
+        // ユーザーが「停止」を押したことによる失敗の場合、フォールバックの追加リクエストは
+        // 送らずそのまま返す(停止操作から実際の終了までの時間短縮を妨げないため)
+        if (cancellationToken.IsCancellationRequested) return primaryResult;
+
+        Logger.Log("TranslationFallback", $"DeepLでの翻訳に失敗したため、Ollamaへフォールバックします: {primaryResult.ErrorMessage}");
+        var fallbackResult = await _fallback.TranslateAsync(text, cancellationToken);
+        if (fallbackResult.Text != null) return fallbackResult;
+
+        return TranslationResult.Failure(
+            $"DeepLでの翻訳に失敗し、Ollamaへのフォールバックも失敗しました。(DeepL: {primaryResult.ErrorMessage} / Ollama: {fallbackResult.ErrorMessage})");
+    }
+}
+
+/// <summary>
 /// Ollama(ローカルで動くLLM)を使った翻訳。APIキー不要、完全にローカル完結。
 /// 事前に Ollama をインストールし、`ollama pull llama3.1` 等でモデルを取得しておく必要がある。
 /// </summary>
@@ -159,6 +256,12 @@ public class OllamaTranslationService : ITranslationService
     // 待ち続けないよう上限を設けておく。
     private static readonly TimeSpan PrepareTimeout = TimeSpan.FromSeconds(10);
 
+    // モデルの事前ロード自体のタイムアウト。大きいモデル(数GB〜十数GB)をディスクから
+    // メモリ/VRAMへ読み込むのは、環境によっては数十秒かかることがあるため、
+    // 用語集抽出より長めの上限にしている。失敗しても致命的ではない(最初の翻訳リクエストが
+    // 多少遅くなるだけ)ため、ここで打ち切っても後続処理は問題なく続行する。
+    private static readonly TimeSpan PreloadTimeout = TimeSpan.FromSeconds(60);
+
     /// <summary>
     /// 参考コンテキストが設定されている場合、セッション開始時に一度だけ用語集を抽出しておく。
     /// 以降の翻訳では、生の参考コンテキストではなくこの短い用語集を使う。
@@ -166,9 +269,16 @@ public class OllamaTranslationService : ITranslationService
     /// 以前はCancellationTokenを受け取っておらず、Ollamaが応答しない場合にユーザーが「停止」を
     /// 押してもこの処理が完了するまで(=タイムアウトするまで)待たされていた。外側から渡される
     /// cancellationTokenと、抽出自体の上限時間(PrepareTimeout)の両方で打ち切れるようにする。
+    ///
+    /// また、用語集の有無にかかわらず、ここでOllamaモデルの事前ロードも行う。
+    /// (TODO: 「Ollamaモデルの事前ロード」への対応。翻訳開始時の初回リクエストで
+    /// モデルがまだメモリに載っていないと、その1回だけ数秒〜数十秒の追加遅延が発生していたため、
+    /// セッション開始時点(「翻訳の準備中...」表示中)に前もってロードを済ませておく)
     /// </summary>
     public async Task PrepareAsync(CancellationToken cancellationToken)
     {
+        await PreloadModelAsync(cancellationToken);
+
         if (string.IsNullOrWhiteSpace(_context))
         {
             _glossary = null;
@@ -229,6 +339,43 @@ public class OllamaTranslationService : ITranslationService
             // (タイムアウト単体の場合もここに含まれ、ユーザー操作によるキャンセルとは区別している)
             Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。用語集無しで続行します。", ex);
             _glossary = null;
+        }
+    }
+
+    /// <summary>
+    /// Ollamaにモデル名のみを渡し、生成(prompt無し)を伴わないリクエストを送ることで、
+    /// モデルをメモリ/VRAMへ事前ロードしておく(Ollama公式で文書化されている手法)。
+    /// 失敗しても致命的ではない(その分だけ最初の翻訳リクエストが遅くなるだけ)ため、
+    /// 例外はログに記録するのみで、呼び出し元(PrepareAsync)には伝播させない
+    /// (ユーザーの「停止」操作によるキャンセルのみ、そのまま伝播させて即座に打ち切れるようにする)。
+    /// </summary>
+    private async Task PreloadModelAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var requestBody = new { model = _model };
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"{_endpoint}/api/generate");
+            request.Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(PreloadTimeout);
+            using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Logger.Log("Ollama.Preload",
+                    $"Ollamaモデルの事前ロードに失敗しました(HTTP {(int)response.StatusCode})。モデル名が正しいか確認してください。");
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw; // ユーザーの「停止」操作。そのまま呼び出し元(PrepareAsync)へ伝播させる
+        }
+        catch (Exception ex)
+        {
+            // タイムアウト(PreloadTimeout超過)やOllama未起動もここに含まれる。
+            // 事前ロードが失敗しても翻訳自体は続行できるため、ログにのみ記録する
+            Logger.Log("Ollama.Preload", "Ollamaモデルの事前ロードに失敗しました。翻訳は通常通り試行します。", ex);
         }
     }
 

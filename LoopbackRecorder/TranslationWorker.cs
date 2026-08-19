@@ -19,7 +19,7 @@ public sealed class TranslationWorker
 {
     private readonly ChannelReader<TranscriptItem> _reader;
     private readonly object _queueLock;
-    private readonly ITranslationService? _translationService;
+    private readonly ITranslationService _translationService;
     private readonly Stopwatch _pipelineClock;
     private readonly LatencyTracker _latencyTracker;
 
@@ -45,7 +45,10 @@ public sealed class TranslationWorker
     {
         _reader = reader;
         _queueLock = queueLock;
-        _translationService = translationService;
+        // 呼び出し元(既存のテスト含む)がnullを渡す互換性は維持しつつ、内部ではNullTranslationService
+        // (IsEnabled=false)に正規化することで、以降のロジックがnullチェックではなくIsEnabledで
+        // 「翻訳せず文字起こしのみ」を判定できるようにする
+        _translationService = translationService ?? NullTranslationService.Instance;
         _pipelineClock = pipelineClock;
         _latencyTracker = latencyTracker;
     }
@@ -79,7 +82,7 @@ public sealed class TranslationWorker
                 continue;
             }
 
-            if (_translationService == null) continue;
+            if (!_translationService.IsEnabled) continue;
 
             if (cancellationToken.IsCancellationRequested)
             {

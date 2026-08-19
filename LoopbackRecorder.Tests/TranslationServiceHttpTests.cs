@@ -220,8 +220,10 @@ public class TranslationServiceHttpTests
     [Fact]
     public async Task Ollama_PrepareAsyncで抽出した用語集が翻訳プロンプトに反映される()
     {
-        // 1回目のリクエスト(PrepareAsync): 用語集抽出。2回目(TranslateAsync): 実際の翻訳。
+        // 1回目のリクエスト(PrepareAsync): モデルの事前ロード。2回目(PrepareAsync): 用語集抽出。
+        // 3回目(TranslateAsync): 実際の翻訳。
         var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""")
             .EnqueueJson(HttpStatusCode.OK, """{"response":"Aetherium => エーテリウム"}""")
             .EnqueueJson(HttpStatusCode.OK, """{"response":"エーテリウムを見つけた"}""");
         var service = new OllamaTranslationService(
@@ -232,21 +234,45 @@ public class TranslationServiceHttpTests
         var result = await service.TranslateAsync("I found Aetherium.", CancellationToken.None);
 
         Assert.Equal("エーテリウムを見つけた", result.Text);
-        // 2回目(翻訳)のリクエストボディに、抽出した用語集の内容が含まれているはず
+        // 3回目(翻訳)のリクエストボディに、抽出した用語集の内容が含まれているはず
         // (raw JSON文字列は日本語が\uXXXXエスケープされるため、prompt値をデコードしてから比較する)
-        Assert.Contains("Aetherium => エーテリウム", handler.GetPromptFrom(1));
+        Assert.Contains("Aetherium => エーテリウム", handler.GetPromptFrom(2));
     }
 
     [Fact]
-    public async Task Ollama_参考コンテキストが空ならPrepareAsyncはリクエストを送らない()
+    public async Task Ollama_参考コンテキストが空でもモデルの事前ロードリクエストは送られる()
     {
-        var handler = new StubHttpMessageHandler(); // 何もEnqueueしない = リクエストが来たら例外で検知
+        // TODO「Ollamaモデルの事前ロード」対応: 用語集(参考コンテキスト)が無い場合でも、
+        // 最初の実翻訳が遅れないよう、PrepareAsync時点でモデルだけは事前ロードしておく
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""");
         var service = new OllamaTranslationService(
             new HttpClient(handler), "llama3.1", "http://localhost:11434", context: "");
 
         await service.PrepareAsync(CancellationToken.None);
 
-        Assert.Empty(handler.Requests);
+        Assert.Single(handler.Requests); // 事前ロードの1件のみ(用語集抽出は行われない)
+        // 事前ロードリクエストは"prompt"を含まない(生成を伴わせないため)
+        using var doc = JsonDocument.Parse(handler.RequestBodies[0]);
+        Assert.False(doc.RootElement.TryGetProperty("prompt", out _));
+        Assert.Equal("llama3.1", doc.RootElement.GetProperty("model").GetString());
+    }
+
+    [Fact]
+    public async Task Ollama_モデル事前ロードが失敗しても例外を投げず翻訳は続行できる()
+    {
+        // 事前ロードの失敗(モデル未インストール等)は致命的ではなく、
+        // その分だけ最初の翻訳が多少遅くなるだけであるべき
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.NotFound, """{"error":"model not found"}""")
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"翻訳結果"}""");
+        var service = new OllamaTranslationService(
+            new HttpClient(handler), "no-such-model", "http://localhost:11434", context: "");
+
+        await service.PrepareAsync(CancellationToken.None); // 例外にならないこと
+        var result = await service.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Equal("翻訳結果", result.Text);
     }
 
     [Fact]
@@ -254,8 +280,9 @@ public class TranslationServiceHttpTests
     {
         // PrepareAsyncの抽出リクエストがエラーになっても、例外を投げずglossary無しで続行する
         var handler = new StubHttpMessageHandler()
-            .EnqueueJson(HttpStatusCode.InternalServerError, "{}")
-            .EnqueueJson(HttpStatusCode.OK, """{"response":"翻訳結果"}""");
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""") // 事前ロード
+            .EnqueueJson(HttpStatusCode.InternalServerError, "{}") // 用語集抽出(失敗)
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"翻訳結果"}"""); // 翻訳
         var service = new OllamaTranslationService(
             new HttpClient(handler), "llama3.1", "http://localhost:11434", context: "some context");
 
@@ -263,6 +290,6 @@ public class TranslationServiceHttpTests
         var result = await service.TranslateAsync("hello", CancellationToken.None);
 
         Assert.Equal("翻訳結果", result.Text);
-        Assert.DoesNotContain("Glossary", handler.RequestBodies[1]);
+        Assert.DoesNotContain("Glossary", handler.RequestBodies[2]);
     }
 }

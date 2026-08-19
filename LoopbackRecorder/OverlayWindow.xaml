@@ -51,7 +51,8 @@
                     </ListBox.ItemContainerStyle>
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <TextBlock Text="{Binding}" Foreground="White"
+                            <TextBlock Text="{Binding}"
+                                       Foreground="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=Foreground}"
                                        FontSize="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=Tag}"
                                        FontWeight="Bold" TextWrapping="Wrap" TextAlignment="Center" Margin="0,2"/>
                         </DataTemplate>

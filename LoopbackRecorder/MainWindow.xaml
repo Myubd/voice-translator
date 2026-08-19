@@ -82,6 +82,12 @@
                             <TextBlock Text="履歴を保存"/>
                         </StackPanel>
                     </Button>
+                    <Button x:Name="CopyTranslationButton" Style="{StaticResource IconButton}" Width="130" Margin="8,0,0,0" Click="CopyTranslationButton_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE8C8;" Margin="0,0,6,0"/>
+                            <TextBlock Text="訳文をコピー"/>
+                        </StackPanel>
+                    </Button>
                 </StackPanel>
 
                 <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">

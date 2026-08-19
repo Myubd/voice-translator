@@ -1,3 +1,6 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace LoopbackRecorder.Tests;
@@ -135,5 +138,214 @@ public class TranslationServiceTests
         var result = OllamaTranslationService.BuildValidatedGlossary(input);
 
         Assert.Equal("Term => Value", result);
+    }
+}
+
+/// <summary>
+/// NullTranslationService(「翻訳せず文字起こしのみ」を表すNullオブジェクト)の単体テスト。
+/// TranslationWorker/AudioPipeline側は、このクラスのIsEnabled==falseを見て翻訳をスキップする
+/// ため、ここでは「IsEnabledがfalseであること」「万一呼ばれてもクラッシュせず失敗結果を返すこと」
+/// の2点のみを検証する(呼び出し側の分岐ロジック自体はTranslationWorkerTestsで検証済み)。
+/// </summary>
+public class NullTranslationServiceTests
+{
+    [Fact]
+    public void IsEnabledはfalseを返す()
+    {
+        Assert.False(NullTranslationService.Instance.IsEnabled);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task TranslateAsyncを呼んでも例外にならず失敗結果を返す()
+    {
+        var result = await NullTranslationService.Instance.TranslateAsync("test", System.Threading.CancellationToken.None);
+
+        Assert.Null(result.Text);
+        Assert.NotNull(result.ErrorMessage);
+    }
+
+    [Fact]
+    public void Instanceは常に同一のシングルトンを返す()
+    {
+        Assert.Same(NullTranslationService.Instance, NullTranslationService.Instance);
+    }
+}
+
+/// <summary>
+/// FallbackTranslationService(DeepL失敗時にOllamaへ自動フォールバックするラッパー)の単体テスト。
+/// 実際のHTTP通信は行わず、呼び出し回数・結果を記録するフェイクサービスで主(DeepL相当)・
+/// 副(Ollama相当)の両方を差し替えて検証する。
+/// </summary>
+public class FallbackTranslationServiceTests
+{
+    private sealed class FakeService : ITranslationService
+    {
+        private readonly Func<string, CancellationToken, Task<TranslationResult>> _handler;
+        // 副(Ollama相当)側のPrepareAsyncはFallbackTranslationService内でバックグラウンド実行
+        // (fire-and-forget)されるため、テスト側で「呼ばれたこと」を確定的に待てるよう、
+        // 呼ばれた時点で完了するTaskCompletionSourceを公開しておく。
+        private readonly TaskCompletionSource<bool> _prepareCompletion = new();
+        public int CallCount { get; private set; }
+        public bool PrepareCalled { get; private set; }
+        public Task PrepareCompletion => _prepareCompletion.Task;
+        public bool IsEnabled => true;
+
+        public FakeService(Func<string, TranslationResult> handler)
+        {
+            _handler = (text, _) => Task.FromResult(handler(text));
+        }
+
+        public FakeService(Func<string, CancellationToken, Task<TranslationResult>> handler)
+        {
+            _handler = handler;
+        }
+
+        public Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            return _handler(text, cancellationToken);
+        }
+
+        public Task PrepareAsync(CancellationToken cancellationToken)
+        {
+            PrepareCalled = true;
+            _prepareCompletion.TrySetResult(true);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>PrepareAsyncの完了を任意のタイミングまで遅延させられるフェイク。
+    /// 「副(Ollama相当)の準備が重くても、主(DeepL相当)完了時点でPrepareAsync全体は
+    /// 返ってくる(=セッション開始がブロックされない)」ことを検証するために使う。</summary>
+    private sealed class SlowPrepareService : ITranslationService
+    {
+        private readonly TaskCompletionSource<bool> _canFinishPrepare = new();
+        private readonly TaskCompletionSource<bool> _prepareStarted = new();
+        public bool PrepareCalled { get; private set; }
+        public bool IsEnabled => true;
+
+        /// <summary>PrepareAsyncが(バックグラウンドスレッドで)実際に呼ばれるまで待つためのTask。
+        /// Task.Runでのスケジューリングには僅かな遅延があるため、単純にPrepareCalledを
+        /// ポーリングするのではなく、この通知を待つことでテストの決定性を保つ。</summary>
+        public Task Started => _prepareStarted.Task;
+
+        public void AllowPrepareToFinish() => _canFinishPrepare.TrySetResult(true);
+
+        public Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+            => Task.FromResult(TranslationResult.Success(text));
+
+        public async Task PrepareAsync(CancellationToken cancellationToken)
+        {
+            PrepareCalled = true;
+            _prepareStarted.TrySetResult(true);
+            await _canFinishPrepare.Task; // AllowPrepareToFinish()が呼ばれるまで完了しない
+        }
+    }
+
+    [Fact]
+    public async Task 主が成功した場合は副を一切呼ばない()
+    {
+        var primary = new FakeService(_ => TranslationResult.Success("primary-ok"));
+        var fallback = new FakeService(_ => TranslationResult.Success("fallback-ok"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Equal("primary-ok", result.Text);
+        Assert.Equal(1, primary.CallCount);
+        Assert.Equal(0, fallback.CallCount); // 成功時に副へ余計なリクエストが飛んでいないこと
+    }
+
+    [Fact]
+    public async Task 主が失敗した場合は副の結果にフォールバックする()
+    {
+        var primary = new FakeService(_ => TranslationResult.Failure("deepl timeout"));
+        var fallback = new FakeService(_ => TranslationResult.Success("fallback-ok"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Equal("fallback-ok", result.Text);
+        Assert.Equal(1, primary.CallCount);
+        Assert.Equal(1, fallback.CallCount);
+    }
+
+    [Fact]
+    public async Task 主副とも失敗した場合は両方のエラーメッセージを含む()
+    {
+        var primary = new FakeService(_ => TranslationResult.Failure("deepl timeout"));
+        var fallback = new FakeService(_ => TranslationResult.Failure("ollama not running"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Null(result.Text);
+        Assert.Contains("deepl timeout", result.ErrorMessage);
+        Assert.Contains("ollama not running", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task 停止操作によるキャンセルの場合は副を呼ばない()
+    {
+        using var cts = new CancellationTokenSource();
+        var primary = new FakeService((_, ct) =>
+        {
+            cts.Cancel(); // 「翻訳中に停止ボタンが押された」状況を再現
+            return Task.FromResult(TranslationResult.Failure("cancelled"));
+        });
+        var fallback = new FakeService(_ => TranslationResult.Success("fallback-ok"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", cts.Token);
+
+        Assert.Equal(0, fallback.CallCount); // 停止操作時は追加のリクエストを送らない
+        Assert.Null(result.Text);
+    }
+
+    [Fact]
+    public async Task PrepareAsyncは主が完了した後副がバックグラウンドで呼ばれる()
+    {
+        var primary = new FakeService(_ => TranslationResult.Success("x"));
+        var fallback = new FakeService(_ => TranslationResult.Success("y"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        await sut.PrepareAsync(CancellationToken.None);
+
+        // 副はバックグラウンド実行(fire-and-forget)のため、PrepareAsync自体の完了を
+        // 待つだけでは呼ばれたかどうかを確定的に判定できない。専用の完了通知を待つ
+        await fallback.PrepareCompletion.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(primary.PrepareCalled);
+        Assert.True(fallback.PrepareCalled);
+    }
+
+    [Fact]
+    public async Task 副の準備が重くても主完了時点でPrepareAsyncはブロックされない()
+    {
+        // Ollamaモデルの事前ロードのような重い処理が副にあっても、DeepLだけで完結する
+        // セッションの開始が待たされてはならない、という今回の変更の核心を検証する
+        var primary = new FakeService(_ => TranslationResult.Success("x"));
+        var slowFallback = new SlowPrepareService();
+        var sut = new FallbackTranslationService(primary, slowFallback);
+
+        var prepareTask = sut.PrepareAsync(CancellationToken.None);
+        var completed = await Task.WhenAny(prepareTask, Task.Delay(TimeSpan.FromSeconds(2)));
+
+        Assert.Same(prepareTask, completed); // 副が完了していなくてもPrepareAsync自体は返っている
+
+        await slowFallback.Started.WaitAsync(TimeSpan.FromSeconds(2)); // 副の準備が(バックグラウンドで)開始されるのを確定的に待つ
+        Assert.True(slowFallback.PrepareCalled);
+
+        slowFallback.AllowPrepareToFinish(); // 後片付け: バックグラウンドタスクを完了させておく
+    }
+
+    [Fact]
+    public void IsEnabledは主の値をそのまま返す()
+    {
+        var alwaysOffPrimary = NullTranslationService.Instance; // IsEnabled=falseの実例として流用
+        var fallback = new FakeService(_ => TranslationResult.Success("y"));
+        var sut = new FallbackTranslationService(alwaysOffPrimary, fallback);
+
+        Assert.False(sut.IsEnabled);
     }
 }
