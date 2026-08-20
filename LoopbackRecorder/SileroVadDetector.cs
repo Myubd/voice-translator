@@ -19,12 +19,16 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 /// 公式実装は「512サンプルごとに区切って、区切りの先頭に前回チャンク末尾64サンプルを
 /// 文脈として付与する」という非重複ウィンドウを前提にしている。
 /// 一方このアプリの音声取得ループは30ms(480サンプル)周期で動いており、512サンプル単位とは
-/// 端数が合わない。そのため、ここでは「直近576サンプルの連続スライディングウィンドウ」を
-/// 毎回の呼び出しで評価する方式を採っている。GRUの内部状態(state)は呼び出しのたびに
-/// 継続して更新するため、公式の32ms周期より短い間隔(30ms)で状態が進むことになるが、
-/// Silero VAD自体は連続音声にロバストな設計であり、実用上の精度に大きな影響は無い
-/// (完全に公式のI/Oパターンと一致させたい場合は、512サンプル単位のバッファリングに
-/// 変更する余地がある)。
+/// 端数が合わない。そのため、既定(useOfficialWindowing=false)では「直近576サンプルの連続
+/// スライディングウィンドウ」を毎回の呼び出しで評価する方式を採っている。GRUの内部状態(state)は
+/// 呼び出しのたびに継続して更新するため、公式の32ms周期より短い間隔(30ms)で状態が進むことになるが、
+/// Silero VAD自体は連続音声にロバストな設計であり、実用上の精度に大きな影響は無いと考えられる
+/// (コードレビューでの分析結果)。
+///
+/// この「実用上の精度に大きな影響は無い」という判断を実測で検証するため、useOfficialWindowing=true
+/// で公式仕様どおりの512サンプルhop+64サンプル文脈のウィンドウ方式も選択できるようにしてある。
+/// このモードは本番のAudioPipelineからは使われず、LoopbackRecorder.Tests/VadWindowingComparisonTests.cs
+/// から2つの方式を実測比較するためだけに使う(GitHubレビューP0-1「Silero VADの入力方式の再検証」対応)。
 /// </summary>
 public sealed class SileroVadDetector : IDisposable
 {
@@ -37,20 +41,34 @@ public sealed class SileroVadDetector : IDisposable
     private const int StateSize = 2 * 1 * 128;
 
     private readonly InferenceSession _session;
+    private readonly bool _useOfficialWindowing;
 
+    // === useOfficialWindowing=false(既定、本番で使用)側の状態 ===
     // 直近576サンプルを保持するスライディングバッファ(先頭が古い)
     private readonly float[] _slidingWindow = new float[EffectiveWindowSamples];
     private int _slidingWindowFilled = 0;
 
+    // === useOfficialWindowing=true(比較検証専用)側の状態 ===
+    // 512サンプル溜まるまでの端数を保持するバッファ(このアプリのチャンクサイズ480とは端数が合わないため)
+    private readonly List<float> _pendingSamples = new();
+    // 直前のウィンドウの末尾64サンプル(次のウィンドウの「文脈」として使う、公式仕様どおりの引き継ぎ方)
+    private readonly float[] _officialContext = new float[ContextSamples];
+    // 512サンプル溜まって新しい推論が走るまでの間、直前の推論結果をそのまま返す
+    // (公式は32ms周期でしか確率を更新しないため、その間の呼び出しでは「最後に分かっている値」を保持するのが
+    // 公式の実際の動作(=呼び出し側は前回値をそのまま使い続ける)に最も近い)
+    private float _officialLastProbability = 0f;
+
     private float[] _state = new float[StateSize];
     private readonly long[] _srInput = { SampleRate };
 
-    public SileroVadDetector(string modelPath)
+    public SileroVadDetector(string modelPath, bool useOfficialWindowing = false)
     {
         if (!File.Exists(modelPath))
         {
             throw new FileNotFoundException($"Silero VADモデルファイルが見つかりません: {modelPath}", modelPath);
         }
+
+        _useOfficialWindowing = useOfficialWindowing;
 
         var options = new SessionOptions
         {
@@ -72,6 +90,9 @@ public sealed class SileroVadDetector : IDisposable
     {
         Array.Clear(_slidingWindow, 0, _slidingWindow.Length);
         _slidingWindowFilled = 0;
+        _pendingSamples.Clear();
+        Array.Clear(_officialContext, 0, _officialContext.Length);
+        _officialLastProbability = 0f;
         _state = new float[StateSize];
     }
 
@@ -81,6 +102,13 @@ public sealed class SileroVadDetector : IDisposable
     /// 近いほど良い。
     /// </summary>
     public float GetSpeechProbability(float[] chunk, int count)
+    {
+        return _useOfficialWindowing
+            ? GetSpeechProbabilityOfficialWindowing(chunk, count)
+            : GetSpeechProbabilityAppDefault(chunk, count);
+    }
+
+    private float GetSpeechProbabilityAppDefault(float[] chunk, int count)
     {
         // スライディングウィンドウを1チャンク分だけ左にシフトし、末尾に新しいサンプルを追加する。
         // (countがEffectiveWindowSamplesより大きいことは通常無い想定だが、防御的に切り詰める)
@@ -104,7 +132,47 @@ public sealed class SileroVadDetector : IDisposable
             return 0f;
         }
 
-        var inputTensor = new DenseTensor<float>(_slidingWindow, new[] { 1, EffectiveWindowSamples });
+        return RunInference(_slidingWindow);
+    }
+
+    /// <summary>
+    /// 公式仕様どおり、512サンプルの新規入力+64サンプルの文脈で、非重複のウィンドウを評価する。
+    /// このアプリのチャンクサイズ(480サンプル)とは端数が合わないため、512サンプル溜まるまでは
+    /// pendingSamplesに蓄積し続け、溜まった時点で1回だけ推論を実行する(1回のGetSpeechProbability呼び出しで
+    /// 複数回512サンプルが溜まることは通常無いが、理論上あり得るためwhileループで処理する)。
+    /// </summary>
+    private float GetSpeechProbabilityOfficialWindowing(float[] chunk, int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            _pendingSamples.Add(chunk[i]);
+        }
+
+        while (_pendingSamples.Count >= WindowSamples)
+        {
+            var newSamples = _pendingSamples.GetRange(0, WindowSamples).ToArray();
+            _pendingSamples.RemoveRange(0, WindowSamples);
+
+            var window = new float[EffectiveWindowSamples];
+            Array.Copy(_officialContext, 0, window, 0, ContextSamples);
+            Array.Copy(newSamples, 0, window, ContextSamples, WindowSamples);
+
+            _officialLastProbability = RunInference(window);
+
+            // 次のウィンドウの文脈として、今回の新規512サンプルのうち末尾64サンプルを引き継ぐ
+            Array.Copy(newSamples, WindowSamples - ContextSamples, _officialContext, 0, ContextSamples);
+        }
+
+        // 512サンプル溜まっていない間の呼び出しでは、直前の推論結果をそのまま返す
+        // (公式実装が32ms周期でしか確率を更新しないのと同じ挙動を模している)
+        return _officialLastProbability;
+    }
+
+    /// <summary>ウィンドウ(576サンプル)1つ分の推論を実行し、GRU状態を更新した上で確率を返す。
+    /// アプリ既定方式・公式ウィンドウ方式のどちらからも共通で呼ばれる。</summary>
+    private float RunInference(float[] window)
+    {
+        var inputTensor = new DenseTensor<float>(window, new[] { 1, EffectiveWindowSamples });
         var stateTensor = new DenseTensor<float>(_state, new[] { 2, 1, 128 });
         var srTensor = new DenseTensor<long>(_srInput, new[] { 1 });
 

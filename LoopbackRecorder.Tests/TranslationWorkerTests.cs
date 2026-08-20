@@ -143,4 +143,65 @@ public class TranslationWorkerTests
         Assert.Same(task, completed);
         Assert.Equal(0, service.CallCount);
     }
+
+    /// <summary>
+    /// freshness-based drop(P0-4)の検証。_pipelineClockは開始していないため常に
+    /// Elapsed=TimeSpan.Zeroを返す。「現在時刻(0)から見て発話終了が5秒前だった」という状況を、
+    /// SegmentEndTimeに負の値を設定することで模擬する(TimeSpanは負の値を許容するため、
+    /// このテスト用途では実用上問題ない)。
+    /// </summary>
+    [Fact]
+    public async Task 発話終了からの経過が閾値を超えている場合は翻訳APIを呼ばずスキップ通知する()
+    {
+        var staleItem = new TranscriptItem
+        {
+            Id = 42,
+            Text = "遅れてきた発話",
+            SegmentStartTime = TimeSpan.FromSeconds(-6),
+            SegmentEndTime = TimeSpan.FromSeconds(-5), // 「現在(0)」から5秒前に発話が終わったことにする
+            WhisperCompletedAt = TimeSpan.FromSeconds(-4.9)
+        };
+        var reader = MakeReaderWith(staleItem);
+        var service = new FakeTranslationService(new TranslationResult("Hello", null));
+        // 3秒より古い発話は翻訳しない、という設定
+        var worker = new TranslationWorker(reader, new object(), service, new Stopwatch(), new LatencyTracker(),
+            maxLatency: TimeSpan.FromSeconds(3));
+
+        var skipped = new List<long>();
+        var translated = new List<TranslatedTextEventArgs>();
+        worker.TranscriptItemSkipped += skipped.Add;
+        worker.TranslatedTextReceived += translated.Add;
+
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal(new long[] { 42 }, skipped);
+        Assert.Empty(translated);
+        Assert.Equal(0, service.CallCount); // 翻訳API自体が呼ばれていないことが重要(DeepLの無駄な課金/レート消費を避けるため)
+    }
+
+    [Fact]
+    public async Task maxLatencyを指定しない場合はどんなに古い発話でも従来通り翻訳される()
+    {
+        // maxLatency省略時は既定でTimeSpan.MaxValueになり、機能自体が無効化される
+        // (以前までの「常に全部処理する」挙動と完全互換であることの確認)
+        var veryStaleItem = new TranscriptItem
+        {
+            Id = 99,
+            Text = "とても遅れてきた発話",
+            SegmentStartTime = TimeSpan.FromSeconds(-101),
+            SegmentEndTime = TimeSpan.FromSeconds(-100),
+            WhisperCompletedAt = TimeSpan.FromSeconds(-99.9)
+        };
+        var reader = MakeReaderWith(veryStaleItem);
+        var service = new FakeTranslationService(new TranslationResult("Hello", null));
+        var worker = new TranslationWorker(reader, new object(), service, new Stopwatch(), new LatencyTracker()); // maxLatency省略
+
+        var translated = new List<TranslatedTextEventArgs>();
+        worker.TranslatedTextReceived += translated.Add;
+
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Single(translated);
+        Assert.Equal(1, service.CallCount);
+    }
 }

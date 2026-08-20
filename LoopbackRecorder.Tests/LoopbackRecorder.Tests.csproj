@@ -24,6 +24,18 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.29.0" />
     <!-- AppSettings.cs(DeepL APIキーのDPAPI暗号化)のコンパイルに必要 -->
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <!-- 実音声E2Eテスト(PipelineEndToEndTests.cs)用。本体プロジェクト(VoiceTranslator.csproj)と
+         同じバージョンを使い、実際にアプリが使うのと寸分違わないVAD→Whisper文字起こし処理を
+         このテストプロジェクトからも呼び出せるようにする。
+         注意: これによりこのテストプロジェクトの依存が重くなる(Whisper.net.Runtimeはネイティブ
+         バイナリを含む)。CI(windows-latest)は本体プロジェクトのビルドで既にこれらを取得しているため
+         追加の実行可否には影響しないが、初回のdotnet restoreにかかる時間は増える。
+         PipelineEndToEndTests自体は、テスト用音声(TestData/*.wav)やWhisperモデルが手元に
+         無い環境では自動的にスキップされるため、これらのパッケージが無くても他のテストの
+         実行には影響しない設計にしている。 -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Whisper.net" Version="1.7.4" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.7.4" />
   </ItemGroup>
 
   <ItemGroup>
@@ -67,6 +79,9 @@
     <!-- TranslationWorker.cs(翻訳ワーカーループ)のテスト用。ITranslationServiceは
          TranslationService.cs(上で取り込み済み)で定義されているため追加のIncludeは不要。 -->
     <Compile Include="..\LoopbackRecorder\TranslationWorker.cs" Link="SourceUnderTest\TranslationWorker.cs" />
+    <!-- OverlayLineOrderer.cs(オーバーレイの行並び替えロジック)のテスト用。WPF非依存の
+         純粋なクラスなので、OverlayWindow.xaml.cs(WPF依存)本体は取り込まずこれだけで完結する。 -->
+    <Compile Include="..\LoopbackRecorder\OverlayLineOrderer.cs" Link="SourceUnderTest\OverlayLineOrderer.cs" />
   </ItemGroup>
 
 </Project>

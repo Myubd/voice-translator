@@ -44,11 +44,18 @@ public sealed record TranslatedTextEventArgs(long Id, string? Text, TimeSpan Seg
 /// 1区間ぶんの遅延計測結果。「発話が終わった瞬間」を基準(0)として、
 /// Whisper・翻訳それぞれにかかった時間と、翻訳完了までの累積遅延を表す。
 /// UIで「現在何秒遅れているか」を表示するために使う。
+///
+/// 翻訳ワーカーは1本しかないため、以前は「翻訳にかかった時間」として計測していた値には、
+/// 実際のAPI呼び出し時間だけでなく「前の項目の処理が終わるまでキューで待っていた時間」も
+/// 混ざっていた(フォールバック機能の追加でDeepL失敗時にOllamaへの呼び出しも直列で走るようになり、
+/// この混同はさらに顕著になった)。ここを分離することで、UIの遅延表示が「単発の重い処理」と
+/// 「キューが詰まっている」のどちらに起因するかをQueueStatusChangedを見なくても判別できるようにする。
 /// </summary>
 public sealed record LatencyMeasurement(
     long Id,
     TimeSpan WhisperDuration,
-    TimeSpan TranslationDuration,
+    TimeSpan QueueWaitDuration,
+    TimeSpan TranslationCallDuration,
     TimeSpan TotalLag);
 
 /// <summary>

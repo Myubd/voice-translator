@@ -42,6 +42,19 @@ public class AudioPipeline : IDisposable
     // 溢れた場合は古いもの(=鮮度が落ちたもの)から捨てて最新の発話を優先する。
     const int TranscriptChannelCapacity = 8;
 
+    // 翻訳ワーカーの並行実行数は、以前はここに固定値(定数)を持たせていたが、
+    // AppSettings.TranslationWorkerCount(設定画面「翻訳ワーカー数」スライダー)から
+    // 実行時に渡せるようにした。RunAsync呼び出し元(MainWindow)は既にAppSettings側で
+    // 1〜4にclamp済みだが、ライブラリ単体で誤った値を渡された場合の防御として
+    // ここでも念のためclampする(0だと翻訳が一切実行されなくなるため)。
+    //
+    // 【完了順序について】並列化すると、翻訳の「完了」順は発話順と一致しなくなりうる
+    // (例: 先に話した内容がDeepL失敗でOllamaにフォールバックして遅れている間に、後から話した
+    // 内容が先に翻訳完了する)。メイン画面の原文/訳文リストとエクスポート機能はId基準で
+    // 行を更新・対応付けする設計になっているため、この完了順の入れ替わりによる影響を受けない。
+    // ゲームオーバーレイ(OverlayWindow)も、Id基準で正しい表示位置に挿入する方式に変更済みのため
+    // (OverlayWindow.UpsertTranslatedLine参照)、この完了順の入れ替わりの影響を受けない。
+
     public float EnergyThreshold
     {
         get => _energyThreshold;
@@ -157,6 +170,12 @@ public class AudioPipeline : IDisposable
     // 音声時刻の算出根拠として_pipelineClock.Elapsedより正確)。
     private long _audioSamplesRead = 0;
 
+    // 発話終了(SegmentEndTime)からこの時間を超えて未処理のまま残っている発話は、
+    // Whisper/翻訳どちらの手前でも処理を打ち切り、最新の発話を優先する(P0-4: freshness-based drop)。
+    // RunAsync呼び出し時に設定値(AppSettings.MaxLatencySeconds)から設定される。
+    // TimeSpan.Zero以下の場合は機能を無効化(=以前までの「常に全部処理する」挙動)する。
+    private TimeSpan _maxLatency = TimeSpan.FromSeconds(3);
+
     private WhisperProcessor? _processor;
     private ITranslationService _translationService = NullTranslationService.Instance;
 
@@ -204,7 +223,7 @@ public class AudioPipeline : IDisposable
         _translationService = service ?? NullTranslationService.Instance;
     }
 
-    public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, int whisperThreadCount, CancellationToken cancellationToken)
+    public async Task RunAsync(string deviceId, string deviceKeyword, string modelPath, string whisperPrompt, string recognitionLanguage, int whisperThreadCount, int translationWorkerCount, double maxLatencySeconds, CancellationToken cancellationToken)
     {
         using var enumerator = new MMDeviceEnumerator();
         var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active).ToList();
@@ -303,6 +322,11 @@ public class AudioPipeline : IDisposable
         // タイムスタンプが0から再スタートする点に注意(エクスポート前に履歴をクリアするか、
         // セッションごとにエクスポートする運用を推奨)。
         _pipelineClock.Restart();
+
+        // 0以下は「機能を無効化」という意図的な設定として扱う(TimeSpan.Zeroにすると
+        // 「常に0秒でタイムアウト=何も処理しない」になってしまうため、代わりにTimeSpan.MaxValueに
+        // することで実質チェックが常にfalseになるようにする)
+        _maxLatency = maxLatencySeconds > 0 ? TimeSpan.FromSeconds(maxLatencySeconds) : TimeSpan.MaxValue;
 
         // Build()後、この中で例外が発生した場合にWhisperProcessorが破棄されないまま
         // 残ってしまうのを防ぐため、以降の処理全体を try/catch で囲む
@@ -446,20 +470,30 @@ public class AudioPipeline : IDisposable
             });
 
             var whisperWorkerTask = RunWhisperWorkerAsync(segmentChannel.Reader, transcriptChannel.Writer, transcriptChannel.Reader);
-            // 翻訳ワーカーの本体はTranslationWorkerへ切り出した。イベントは自身のpublicイベントへ中継する。
-            var translationWorker = new TranslationWorker(transcriptChannel.Reader, _transcriptQueueLock, _translationService, _pipelineClock, _latencyTracker);
-            translationWorker.TranscriptItemSkipped += id => TranscriptItemSkipped?.Invoke(id);
-            translationWorker.TranslatedTextReceived += args => TranslatedTextReceived?.Invoke(args);
-            translationWorker.TranslationErrorOccurred += msg => TranslationErrorOccurred?.Invoke(msg);
-            translationWorker.LatencyMeasured += m =>
+
+            // 翻訳ワーカーをTranslationWorkerCount本並列で起動する。各インスタンスは同じ
+            // transcriptChannel.Reader/_transcriptQueueLockを共有するが、キューの読み出しは
+            // ロックで排他されているため競合しない(詳細はTranslationWorkerCountのコメント参照)。
+            // イベントはすべて自身のpublicイベントへ中継する(どのワーカーが発火させたかは
+            // 呼び出し元からは区別する必要がない)。
+            var translationWorkerTasks = new List<Task>();
+            var effectiveTranslationWorkerCount = Math.Clamp(translationWorkerCount, 1, 4);
+            for (int i = 0; i < effectiveTranslationWorkerCount; i++)
             {
-                LatencyMeasured?.Invoke(m);
-                // 同じタイミングで2つのキューの滞留件数も通知する。
-                // Channel.Reader.Countは他スレッドから読んでもスレッドセーフ(内部でロック済み)なので、
-                // ここで直接参照して問題ない。
-                QueueStatusChanged?.Invoke(new PipelineQueueStatus(segmentChannel.Reader.Count, transcriptChannel.Reader.Count));
-            };
-            var translationWorkerTask = translationWorker.RunAsync(cancellationToken);
+                var translationWorker = new TranslationWorker(transcriptChannel.Reader, _transcriptQueueLock, _translationService, _pipelineClock, _latencyTracker, _maxLatency);
+                translationWorker.TranscriptItemSkipped += id => TranscriptItemSkipped?.Invoke(id);
+                translationWorker.TranslatedTextReceived += args => TranslatedTextReceived?.Invoke(args);
+                translationWorker.TranslationErrorOccurred += msg => TranslationErrorOccurred?.Invoke(msg);
+                translationWorker.LatencyMeasured += m =>
+                {
+                    LatencyMeasured?.Invoke(m);
+                    // 同じタイミングで2つのキューの滞留件数も通知する。
+                    // Channel.Reader.Countは他スレッドから読んでもスレッドセーフ(内部でロック済み)なので、
+                    // ここで直接参照して問題ない。
+                    QueueStatusChanged?.Invoke(new PipelineQueueStatus(segmentChannel.Reader.Count, transcriptChannel.Reader.Count));
+                };
+                translationWorkerTasks.Add(translationWorker.RunAsync(cancellationToken));
+            }
 
             var readBuffer = new float[ChunkSamples];
             // VADの状態(発話中か、直近の無音チャンク数、プリロールバッファ等)は
@@ -551,9 +585,9 @@ public class AudioPipeline : IDisposable
                     Logger.Log("AudioPipeline.Whisper", "Whisperワーカーの終了待機中に例外が発生しました。", ex);
                 }
 
-                // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカーの完了を待つ。
-                // TryComplete()を使う(Complete()は使わない)理由: RunWhisperWorkerAsync側のfinally節が
-                // 既にtranscriptWriter.TryComplete()を呼んでいるため、ここでも呼ばれた時点で
+                // Whisper側が終わったら文字起こし結果のキューも締め切り、翻訳ワーカー(全インスタンス)の
+                // 完了を待つ。TryComplete()を使う(Complete()は使わない)理由: RunWhisperWorkerAsync側の
+                // finally節が既にtranscriptWriter.TryComplete()を呼んでいるため、ここでも呼ばれた時点で
                 // このキューは既に完了済みになっている。Complete()は「既に完了済みの場合は
                 // ChannelClosedExceptionを投げる」仕様のため、録音を停止するたびに必ずこの例外が
                 // 発生し、ユーザーに「The channel has been closed.」というエラーダイアログが
@@ -562,7 +596,7 @@ public class AudioPipeline : IDisposable
                 transcriptChannel.Writer.TryComplete();
                 try
                 {
-                    await translationWorkerTask;
+                    await Task.WhenAll(translationWorkerTasks);
                 }
                 catch (Exception ex)
                 {
@@ -749,6 +783,22 @@ public class AudioPipeline : IDisposable
     private async Task TranscribeSegmentAsync(SpeechSegment segment, ChannelWriter<TranscriptItem> transcriptWriter, ChannelReader<TranscriptItem> transcriptReader)
     {
         if (_processor == null) return;
+
+        // freshness-based drop(P0-4): Whisper推論は全処理の中で最も重い(数百ms〜数秒)ため、
+        // ここで古い発話を弾いておくことが最も効果的。「キューの件数」だけを見ていると、
+        // 例えばキューが2件程度でも1件のWhisper処理に長く時間がかかっている状況(高負荷時等)では
+        // 実際の遅延はどんどん広がっていく、という問題を検出できなかった(GitHubレビューのP0-4指摘)。
+        // 経過時間を直接見ることで、「詰まっているかどうか」ではなく「この発話はもう聞き逃した
+        // 過去の話題として扱ってよいか」を判断する。
+        var currentLatency = _pipelineClock.Elapsed - segment.EndTime;
+        if (currentLatency > _maxLatency)
+        {
+            _droppedSegmentCount++;
+            SegmentsDropped?.Invoke(_droppedSegmentCount);
+            Logger.LogMetric("Queue", ("queue", "segment"), ("reason", "stale"),
+                ("latency_ms", (int)currentLatency.TotalMilliseconds), ("dropped_total", _droppedSegmentCount));
+            return;
+        }
 
         // 以前はWhisperへ渡すためだけにMemoryStream上へWAVヘッダ付きで書き出していたが、
         // Whisper.netのProcessAsyncは float[] samples を直接受け付けるオーバーロードを持っており、

@@ -200,6 +200,24 @@
                         <TextBlock Text="文字起こしに使うCPUスレッド数。大きいほど処理は速くなりますが、ゲームなど他アプリの動作が重くなることがあります"
                                    Style="{StaticResource HelpText}"/>
 
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <TextBlock Text="翻訳ワーカー数" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
+                            <TextBlock Text="{Binding ElementName=TranslationWorkerCountSlider, Path=Value, StringFormat='{}{0:F0}'}"/>
+                        </StackPanel>
+                        <Slider x:Name="TranslationWorkerCountSlider" Minimum="1" Maximum="4"
+                                TickFrequency="1" IsSnapToTickEnabled="True" Margin="0,0,0,4"/>
+                        <TextBlock Text="翻訳を同時に何件まで並行処理するか。大きいほど発話が連続してもキューが詰まりにくくなりますが、DeepL無料プランではレート制限に引っかかりやすくなります"
+                                   Style="{StaticResource HelpText}"/>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                            <TextBlock Text="最大許容遅延(秒)" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
+                            <TextBlock Text="{Binding ElementName=MaxLatencySecondsSlider, Path=Value, StringFormat='{}{0:F1}秒'}"/>
+                        </StackPanel>
+                        <Slider x:Name="MaxLatencySecondsSlider" Minimum="0" Maximum="10" TickFrequency="0.5"
+                                IsSnapToTickEnabled="True" Margin="0,0,0,4"/>
+                        <TextBlock Text="発話が終わってからこの秒数を超えても処理が追いついていない場合、その発話は諦めて最新の会話を優先します(ゲーム実況向け)。0にすると無効化し、どんなに遅れても必ず全部処理します"
+                                   Style="{StaticResource HelpText}"/>
+
                         <TextBlock Text="翻訳エンジン" Style="{StaticResource SectionLabel}"/>
                         <TextBlock Text="翻訳バックエンド" Style="{StaticResource FieldLabel}"/>
                         <ComboBox x:Name="BackendComboBox" Margin="0,0,0,16" SelectionChanged="BackendComboBox_SelectionChanged">

@@ -124,7 +124,7 @@ public partial class MainWindow : Window
                 if (args.Text != null)
                 {
                     TranslatedListBox.ScrollIntoView(TranslatedListBox.Items[^1]);
-                    _overlayWindow?.AddTranslatedLine(args.Text);
+                    _overlayWindow?.UpsertTranslatedLine(args.Id, args.Text);
                 }
             });
         };
@@ -232,8 +232,11 @@ public partial class MainWindow : Window
         }
 
         var m = _lastLatencyMeasurement;
+        // 「翻訳」を「待ち」(キューで前の項目の処理を待っていた時間)と「呼び出し」(実際のDeepL/Ollama
+        // API呼び出しにかかった時間)に分けて表示する。この2つを合算していた頃は、遅延が大きい時に
+        // 「翻訳APIが遅い」のか「翻訳ワーカーが1本しかなく詰まっている」のかを見分けられなかった。
         var text = $"遅延: {m.TotalLag.TotalSeconds:0.0}秒" +
-            $" (認識 {m.WhisperDuration.TotalSeconds:0.0}s / 翻訳 {m.TranslationDuration.TotalSeconds:0.0}s)";
+            $" (認識 {m.WhisperDuration.TotalSeconds:0.0}s / 翻訳待ち {m.QueueWaitDuration.TotalSeconds:0.0}s / 翻訳 {m.TranslationCallDuration.TotalSeconds:0.0}s)";
 
         // キューが2件以上溜まっている場合のみ表示する(0〜1件は正常範囲であり、常時表示すると
         // かえって「常に何か詰まっている」ように見えてノイズになるため)
@@ -446,7 +449,7 @@ public partial class MainWindow : Window
 
         try
         {
-            _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _settings.WhisperThreadCount, _cts.Token);
+            _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _settings.WhisperThreadCount, _settings.TranslationWorkerCount, _settings.MaxLatencySeconds, _cts.Token);
             await _pipelineTask;
         }
         catch (OperationCanceledException)

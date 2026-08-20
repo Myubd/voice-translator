@@ -8,7 +8,10 @@ namespace LoopbackRecorder;
 
 public partial class OverlayWindow : Window
 {
-    private int _maxLines = 4;
+    // 行の並び順の計算(Id順への挿入・上限行数超過時の間引き)はOverlayLineOrderer
+    // (WPF非依存の純粋ロジック、単体テスト可能)に委譲する。このクラスはOrdererの結果を
+    // TranslatedListBox(WPFのUI要素)へ反映する役割に専念する。
+    private readonly OverlayLineOrderer _orderer = new(maxLines: 4);
 
     public OverlayWindow()
     {
@@ -25,7 +28,15 @@ public partial class OverlayWindow : Window
         }
 
         TranslatedListBox.Tag = fontSize;
-        _maxLines = System.Math.Max(1, maxLines);
+
+        // 表示行数の上限を減らした場合、既に表示済みの行が新しい上限を超えている可能性がある。
+        // OrdererのMaxLinesを更新した上でTrimToMax()を呼び、間引かれた件数だけUI側からも削除する。
+        _orderer.MaxLines = System.Math.Max(1, maxLines);
+        var removedCount = _orderer.TrimToMax();
+        for (int i = 0; i < removedCount; i++)
+        {
+            TranslatedListBox.Items.RemoveAt(0);
+        }
 
         byte alpha = (byte)(System.Math.Clamp(opacity, 0.0, 1.0) * 255);
         BackgroundBorder.Background = new SolidColorBrush(Color.FromArgb(alpha, 0, 0, 0));
@@ -41,39 +52,63 @@ public partial class OverlayWindow : Window
             // (真っ白なテキストが読めなくなるより、変更前の状態を保つ方が安全なため)
         }
 
-        TrimAndRefreshEmphasis();
+        RefreshEmphasis();
     }
 
-    /// <summary>訳文を1行追加する。
+    /// <summary>訳文を1行、発話順(Id昇順)の正しい位置に挿入(または既存行を更新)する。
     /// UI要素(TranslatedListBox)を直接操作するため、必ずUIスレッドから呼ぶ必要がある。
-    /// 以前はこの制約がコメントのみで、呼び出し元の規律に依存していたため見えにくかった。
     /// Dispatcher.CheckAccess()で明示的にチェックし、UIスレッド以外から呼ばれた場合は
-    /// 自動的にUIスレッドへ委譲することで、呼び出し側のミスによるクラッシュを防ぐ。</summary>
-    public void AddTranslatedLine(string text)
+    /// 自動的にUIスレッドへ委譲することで、呼び出し側のミスによるクラッシュを防ぐ。
+    ///
+    /// 以前は「届いた順にそのまま追記する」実装(AddTranslatedLine)だったが、翻訳ワーカーを
+    /// 複数並列で動かすようになったことで、翻訳の完了順が発話順と一致しなくなる場合が生じた
+    /// (例: 先に話した内容がDeepL失敗でOllamaへフォールバックして遅れている間に、後から話した
+    /// 内容が先に翻訳完了する)。届いた順にそのまま追記すると、ゲーム実況の字幕として
+    /// 時系列が入れ替わって表示されてしまうため、Id(発話順に単調増加する識別子)を基準に
+    /// 正しい位置へ挿入する方式に変更した(実際の並び替え計算はOverlayLineOrdererが行う)。</summary>
+    public void UpsertTranslatedLine(long id, string text)
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.Invoke(() => AddTranslatedLine(text));
+            Dispatcher.Invoke(() => UpsertTranslatedLine(id, text));
             return;
         }
 
-        TranslatedListBox.Items.Add(text);
-        TrimAndRefreshEmphasis();
+        var result = _orderer.Upsert(id, text);
 
-        if (TranslatedListBox.Items.Count > 0)
+        if (result.IsUpdate)
+        {
+            TranslatedListBox.Items[result.Index] = text;
+        }
+        else
+        {
+            // 先頭からの間引きは、新しい行を挿入する「前」に計算されたものなので、
+            // UI側でも同じ順序(先に間引き→その後に挿入)で反映する。
+            for (int i = 0; i < result.RemovedFromFrontCount; i++)
+            {
+                TranslatedListBox.Items.RemoveAt(0);
+            }
+
+            if (!result.WasTrimmedAway)
+            {
+                TranslatedListBox.Items.Insert(result.Index, text);
+            }
+            // WasTrimmedAwayがtrueの場合(=挿入した行が、既にMaxLines件の新しい発話で
+            // 埋まっていたため即座に間引かれた場合)は、UI側にも何も挿入しない。
+        }
+
+        RefreshEmphasis();
+
+        if (!result.WasTrimmedAway && result.IsLatest && TranslatedListBox.Items.Count > 0)
         {
             TranslatedListBox.ScrollIntoView(TranslatedListBox.Items[^1]);
         }
     }
 
-    /// <summary>設定された最大行数までに切り詰め、最新行だけを目立たせる</summary>
-    private void TrimAndRefreshEmphasis()
+    /// <summary>最新行だけを目立たせる(不透明度・太字)見た目を再計算する。
+    /// 行の増減自体はOverlayLineOrderer側の責務であり、ここでは見た目の更新のみを行う。</summary>
+    private void RefreshEmphasis()
     {
-        while (TranslatedListBox.Items.Count > _maxLines)
-        {
-            TranslatedListBox.Items.RemoveAt(0);
-        }
-
         TranslatedListBox.UpdateLayout();
         int count = TranslatedListBox.Items.Count;
         for (int i = 0; i < count; i++)
@@ -96,6 +131,7 @@ public partial class OverlayWindow : Window
             return;
         }
 
+        _orderer.Clear();
         TranslatedListBox.Items.Clear();
     }
 

@@ -21,7 +21,7 @@ public class AppSettingsTests : IDisposable
     private static readonly string[] EnvKeys =
     {
         "DEVICE_KEYWORD", "DEVICE_ID", "TRANSLATION_BACKEND", "ENABLE_DEEPL_TO_OLLAMA_FALLBACK", "OLLAMA_MODEL", "OLLAMA_ENDPOINT",
-        "WHISPER_MODEL_PATH", "WHISPER_THREAD_COUNT", "DEEPL_API_KEY_ENC", "DEEPL_API_KEY",
+        "WHISPER_MODEL_PATH", "WHISPER_THREAD_COUNT", "TRANSLATION_WORKER_COUNT", "MAX_LATENCY_SECONDS", "DEEPL_API_KEY_ENC", "DEEPL_API_KEY",
         "VAD_THRESHOLD", "VAD_HYSTERESIS_RATIO", "GAME_AUDIO_PRIORITY_MODE", "GAME_AUDIO_PRIORITY_MULTIPLIER",
         "OVERLAY_FONT_SIZE", "OVERLAY_OPACITY", "OVERLAY_MAX_LINES", "OVERLAY_FONT_COLOR",
         "WHISPER_PROMPT", "RECOGNITION_LANGUAGE", "TARGET_LANGUAGE_CODE", "OLLAMA_CONTEXT",
@@ -180,6 +180,76 @@ public class AppSettingsTests : IDisposable
     }
 
     [Fact]
+    public void 翻訳ワーカー数が範囲外の場合は上限の4にクランプされる()
+    {
+        // DeepLのレート制限を考慮し、Whisperスレッド数と異なりCPUコア数に連動しない
+        // 固定上限(4)を採用しているため、極端に大きい値でも常に4であることを検証する。
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "TRANSLATION_WORKER_COUNT=99\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(4, settings.TranslationWorkerCount);
+    }
+
+    [Fact]
+    public void 翻訳ワーカー数が0以下の場合は下限の1にクランプされる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "TRANSLATION_WORKER_COUNT=0\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(1, settings.TranslationWorkerCount);
+    }
+
+    [Fact]
+    public void 翻訳ワーカー数が未設定の場合は既定値2になる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "DEVICE_KEYWORD=Test\n"); // TRANSLATION_WORKER_COUNT自体は書かない
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(2, settings.TranslationWorkerCount);
+    }
+
+    [Fact]
+    public void 最大許容遅延が極端に大きい場合は上限の60秒にクランプされる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "MAX_LATENCY_SECONDS=99999\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(60.0, settings.MaxLatencySeconds);
+    }
+
+    [Fact]
+    public void 最大許容遅延に0を指定すると機能無効化の意図としてそのまま保持される()
+    {
+        // 0以下は「機能を無効化(常に全部処理する)」という意図的な設定のため、
+        // WhisperThreadCount等と異なり下限を1にクランプしない。
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "MAX_LATENCY_SECONDS=0\n");
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(0.0, settings.MaxLatencySeconds);
+    }
+
+    [Fact]
+    public void 最大許容遅延が未設定の場合は既定値3秒になる()
+    {
+        var path = CreateTempEnvPath();
+        File.WriteAllText(path, "DEVICE_KEYWORD=Test\n"); // MAX_LATENCY_SECONDS自体は書かない
+
+        var settings = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal(3.0, settings.MaxLatencySeconds);
+    }
+
+    [Fact]
     public void SaveしてLoadすると基本項目がラウンドトリップする()
     {
         var path = CreateTempEnvPath();
@@ -194,6 +264,8 @@ public class AppSettingsTests : IDisposable
             OverlayMaxLines = 7,
             OverlayFontColor = "#66D9FF",
             WhisperThreadCount = 3,
+            TranslationWorkerCount = 3,
+            MaxLatencySeconds = 4.5,
             RecognitionLanguage = "en",
             TargetLanguageCode = "EN-US",
         };
@@ -214,6 +286,8 @@ public class AppSettingsTests : IDisposable
         Assert.Equal(7, reloaded.OverlayMaxLines);
         Assert.Equal("#66D9FF", reloaded.OverlayFontColor);
         Assert.Equal(3, reloaded.WhisperThreadCount);
+        Assert.Equal(3, reloaded.TranslationWorkerCount);
+        Assert.Equal(4.5, reloaded.MaxLatencySeconds);
         Assert.Equal("en", reloaded.RecognitionLanguage);
         Assert.Equal("EN-US", reloaded.TargetLanguageCode);
     }

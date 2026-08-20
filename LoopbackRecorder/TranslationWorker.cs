@@ -1,3 +1,4 @@
+using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Channels;
@@ -22,8 +23,11 @@ public sealed class TranslationWorker
     private readonly ITranslationService _translationService;
     private readonly Stopwatch _pipelineClock;
     private readonly LatencyTracker _latencyTracker;
+    private readonly TimeSpan _maxLatency;
 
-    /// <summary>停止操作で既にキャンセル済みのため翻訳を試みずスキップした項目のId</summary>
+    /// <summary>停止操作で既にキャンセル済みのため翻訳を試みずスキップした項目のId。
+    /// freshness-based drop(P0-4、maxLatency超過)でスキップした場合もこのイベントで通知する
+    /// (UI側から見れば「この項目は結局翻訳されない」という結果は同じであるため)。</summary>
     public event System.Action<long>? TranscriptItemSkipped;
     public event System.Action<TranslatedTextEventArgs>? TranslatedTextReceived;
     public event System.Action<string>? TranslationErrorOccurred;
@@ -36,12 +40,17 @@ public sealed class TranslationWorker
     /// <param name="translationService">翻訳サービス。nullの場合はキューを読み飛ばし続ける(翻訳無効時の挙動)</param>
     /// <param name="pipelineClock">パイプライン全体で共有する経過時間計測用のStopwatch</param>
     /// <param name="latencyTracker">遅延計算用</param>
+    /// <param name="maxLatency">発話終了(SegmentEndTime)からこの時間を超えて未処理のまま
+    /// このワーカーに回ってきた項目は、翻訳API呼び出し自体を行わずスキップする
+    /// (freshness-based drop、GitHubレビューP0-4対応)。既定値(TimeSpan.MaxValue)では
+    /// 実質的にチェックを無効化する(常に全項目を翻訳する、以前までの挙動)。</param>
     public TranslationWorker(
         ChannelReader<TranscriptItem> reader,
         object queueLock,
         ITranslationService? translationService,
         Stopwatch pipelineClock,
-        LatencyTracker latencyTracker)
+        LatencyTracker latencyTracker,
+        TimeSpan? maxLatency = null)
     {
         _reader = reader;
         _queueLock = queueLock;
@@ -51,6 +60,7 @@ public sealed class TranslationWorker
         _translationService = translationService ?? NullTranslationService.Instance;
         _pipelineClock = pipelineClock;
         _latencyTracker = latencyTracker;
+        _maxLatency = maxLatency ?? TimeSpan.MaxValue;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -92,6 +102,25 @@ public sealed class TranslationWorker
                 continue;
             }
 
+            // ここが「このワーカーが実際にこの項目の翻訳を開始した時刻」。item.WhisperCompletedAtから
+            // ここまでの差分が、キュー待ち時間(前の項目の処理待ち。フォールバック発生時のDeepL→Ollama
+            // 直列呼び出しも含む)。TranslateAsync呼び出し前に取ることで、これから計測する
+            // translationCallDurationにキュー待ち分が混ざらないようにする。
+            var dequeuedAt = _pipelineClock.Elapsed;
+
+            // freshness-based drop(P0-4): 発話終了からここまでの経過時間が閾値を超えていれば、
+            // DeepL/Ollamaへの呼び出し自体を行わずスキップする。翻訳APIの呼び出しは(フォールバック込みで)
+            // 数秒〜数十秒かかりうる、パイプライン中で最も重い処理の1つなので、ここで弾いておくことが
+            // 「常に最新の会話を翻訳する」という目標に対して最も効果が大きい。
+            var currentLatency = dequeuedAt - item!.SegmentEndTime;
+            if (currentLatency > _maxLatency)
+            {
+                TranscriptItemSkipped?.Invoke(item.Id);
+                Logger.LogMetric("Queue", ("queue", "transcript"), ("reason", "stale"),
+                    ("latency_ms", (int)currentLatency.TotalMilliseconds));
+                continue;
+            }
+
             var result = await _translationService.TranslateAsync(item!.Text, cancellationToken);
             var translationCompletedAt = _pipelineClock.Elapsed;
 
@@ -113,8 +142,9 @@ public sealed class TranslationWorker
             }
 
             // 遅延計測: 発話終了(SegmentEndTime)を基準に、Whisper完了までの時間・
-            // 翻訳完了までの時間・トータルの遅延を算出して通知する(計算自体はLatencyTrackerに委譲)
-            var measurement = _latencyTracker.Measure(item, translationCompletedAt);
+            // キュー待ち時間・翻訳呼び出し時間・トータルの遅延を算出して通知する
+            // (計算自体はLatencyTrackerに委譲)
+            var measurement = _latencyTracker.Measure(item, dequeuedAt, translationCompletedAt);
             LatencyMeasured?.Invoke(measurement);
         }
     }

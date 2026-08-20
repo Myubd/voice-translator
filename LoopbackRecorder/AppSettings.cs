@@ -41,6 +41,23 @@ public partial class AppSettings
     /// (最低2)とし、必要な場合のみユーザーが引き上げられるようにしている。</summary>
     public int WhisperThreadCount { get; set; } = Math.Max(2, Environment.ProcessorCount / 4);
 
+    /// <summary>翻訳ワーカーの並行実行数。以前は1本の直列ループだったため、DeepL失敗時に
+    /// Ollamaへフォールバックする処理が発生すると、1件の翻訳にDeepL+Ollama両方のタイムアウト
+    /// (最大45秒程度)がかかり、その間キューの他の項目が一切処理されない、という問題があった。
+    /// 既定値2は、DeepL無料プランのレート制限を考慮した控えめな値。上げすぎるとDeepL側から
+    /// 429(レート制限)エラーを受けやすくなるため、上限は4にclampしている。</summary>
+    public int TranslationWorkerCount { get; set; } = 2;
+
+    /// <summary>これ以上遅れた発話は、処理を諦めて最新の発話を優先するための閾値(秒)。
+    /// キューの「件数」だけで溢れを判定していると、処理自体が遅い(Whisper推論が重い、
+    /// 翻訳APIが遅い等)場合に、キューは詰まっていなくても実際の遅延はどんどん広がっていく、
+    /// という状況を検出できない。例えばキューがわずか2件でも、1件の処理に10秒かかれば
+    /// 20秒の遅延になる。ゲーム実況のようなリアルタイム用途では「全部訳す」より
+    /// 「常に最新の会話を訳す」方が価値があるため、経過時間(SegmentEndTimeからの経過)を
+    /// 直接見て、これを超えた発話はWhisper/翻訳どちらの手前でも処理自体を打ち切る。
+    /// 0以下を設定すると機能自体を無効化できる(常にすべて処理する、以前までの挙動)。</summary>
+    public double MaxLatencySeconds { get; set; } = 3.0;
+
     /// <summary>VAD(発話区間検出)の開始判定閾値。Silero VAD(ONNXニューラルモデル)を
     /// 使う場合は発話確率(0〜1、大きいほど「発話らしい」と判定されにくくなる)のスケール。
     /// (Silero VAD導入前はRMS実効値のスケール(概ね0.001〜0.05)だった。
@@ -126,6 +143,22 @@ public partial class AppSettings
         if (int.TryParse(Environment.GetEnvironmentVariable("WHISPER_THREAD_COUNT"), out var whisperThreadCount))
         {
             settings.WhisperThreadCount = Math.Clamp(whisperThreadCount, 1, Environment.ProcessorCount);
+        }
+
+        // 同じ理屈でTranslationWorkerCountも1〜4にclampする。0以下だと翻訳が一切実行されなくなり、
+        // 大きすぎるとDeepLのレート制限に抵触しやすくなるため。
+        if (int.TryParse(Environment.GetEnvironmentVariable("TRANSLATION_WORKER_COUNT"), out var translationWorkerCount))
+        {
+            settings.TranslationWorkerCount = Math.Clamp(translationWorkerCount, 1, 4);
+        }
+
+        // 0以下は「機能を無効化(常に全部処理する)」という意図的な設定として許容するため、
+        // 下限のclampはしない。上限だけ、誤って極端に大きい値(数千秒等)を入力してしまった場合に
+        // 備えて60秒に制限しておく(それ以上待つくらいなら実質的に無効化したのと同じであるため)。
+        if (double.TryParse(Environment.GetEnvironmentVariable("MAX_LATENCY_SECONDS"),
+                NumberStyles.Float, CultureInfo.InvariantCulture, out var maxLatencySeconds))
+        {
+            settings.MaxLatencySeconds = Math.Min(maxLatencySeconds, 60.0);
         }
 
         // DeepL APIキー: DPAPIで暗号化された新形式(DEEPL_API_KEY_ENC)を優先して読み込む。
@@ -382,6 +415,14 @@ public partial class AppSettings
             "# ゲームなど他アプリのCPU負荷に影響しやすくなる",
             $"WHISPER_THREAD_COUNT={WhisperThreadCount}",
             "",
+            "# 翻訳ワーカーの並行実行数(1〜4)。大きいほどキューが詰まりにくくなるが、",
+            "# DeepL無料プランのレート制限に抵触しやすくなる",
+            $"TRANSLATION_WORKER_COUNT={TranslationWorkerCount}",
+            "",
+            "# 発話終了からこの秒数を超えて未処理のまま残っている発話は、処理を諦めて",
+            "# 最新の会話を優先する(0以下で機能を無効化=常に全部処理する)",
+            $"MAX_LATENCY_SECONDS={MaxLatencySeconds.ToString(CultureInfo.InvariantCulture)}",
+            "",
             "# Whisperに渡す認識ヒント(固有名詞など。カンマ区切りで自由に記述。改行は\\nでエスケープ済み)",
             $"WHISPER_PROMPT={escapedPrompt}",
             "",
@@ -445,6 +486,8 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("OVERLAY_FONT_COLOR", OverlayFontColor);
         Environment.SetEnvironmentVariable("WHISPER_MODEL_PATH", WhisperModelPath);
         Environment.SetEnvironmentVariable("WHISPER_THREAD_COUNT", WhisperThreadCount.ToString(CultureInfo.InvariantCulture));
+        Environment.SetEnvironmentVariable("TRANSLATION_WORKER_COUNT", TranslationWorkerCount.ToString(CultureInfo.InvariantCulture));
+        Environment.SetEnvironmentVariable("MAX_LATENCY_SECONDS", MaxLatencySeconds.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("WHISPER_PROMPT", WhisperPrompt);
         Environment.SetEnvironmentVariable("RECOGNITION_LANGUAGE", RecognitionLanguage);
         Environment.SetEnvironmentVariable("TARGET_LANGUAGE_CODE", TargetLanguageCode);

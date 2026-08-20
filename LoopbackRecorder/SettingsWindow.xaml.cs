@@ -98,6 +98,8 @@ public partial class SettingsWindow : Window
         // (コア数が16を超えるハイエンド環境でも、逆にコア数が少ない環境でも矛盾しないように)
         WhisperThreadCountSlider.Maximum = Environment.ProcessorCount;
         WhisperThreadCountSlider.Value = Math.Clamp(Settings.WhisperThreadCount, 1, Environment.ProcessorCount);
+        TranslationWorkerCountSlider.Value = Math.Clamp(Settings.TranslationWorkerCount, 1, 4);
+        MaxLatencySecondsSlider.Value = Math.Clamp(Settings.MaxLatencySeconds, 0, 10);
 
         // 認識言語・翻訳先言語のドロップダウンを初期化
         RecognitionLanguageComboBox.ItemsSource = LanguageCatalog.SourceLanguages;
@@ -478,6 +480,8 @@ public partial class SettingsWindow : Window
         }
         Settings.WhisperModelPath = WhisperModelComboBox.Text;
         Settings.WhisperThreadCount = (int)WhisperThreadCountSlider.Value;
+        Settings.TranslationWorkerCount = (int)TranslationWorkerCountSlider.Value;
+        Settings.MaxLatencySeconds = MaxLatencySecondsSlider.Value;
         Settings.TranslationBackend = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deepl";
         Settings.DeepLApiKey = _deepLApiKey;
         Settings.OllamaModel = OllamaModelComboBox.Text;
