@@ -60,6 +60,10 @@
          BuildValidatedGlossaryは外部通信もWPF依存も無い純粋なロジックなので、
          VoiceActivitySegmenterと同じ方式(直接コンパイル)でテストできる。 -->
     <Compile Include="..\LoopbackRecorder\TranslationService.cs" Link="SourceUnderTest\TranslationService.cs" />
+    <!-- TranslationConcurrencyLimiter.cs(ConcurrencyLimitedTranslationService)。
+         AppSettings.CreateTranslationServiceが返すサービスをラップするため、
+         AppSettings.csのテストのコンパイルに必要。 -->
+    <Compile Include="..\LoopbackRecorder\TranslationConcurrencyLimiter.cs" Link="SourceUnderTest\TranslationConcurrencyLimiter.cs" />
     <!-- AppSettings.cs(.envの読み書き・クランプ処理)の単体テスト用。
          AppSettings.Hotkeys.cs(WPF依存のホットキー解析部分)はpartial分割してあり、
          テスト側では意図的にIncludeしない(WPF無しでこのプロジェクトをビルドできるようにするため)。

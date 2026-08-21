@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace LoopbackRecorder.Tests;
@@ -304,29 +306,33 @@ public class AppSettingsTests : IDisposable
     }
 
     [Fact]
-    public void DeepL選択でAPIキー設定済みの場合はDeepLTranslationServiceが返る()
+    public void DeepL選択でAPIキー設定済みの場合はConcurrencyLimitedTranslationServiceでラップされたDeepLTranslationServiceが返る()
     {
+        // コードレビュー対応: DeepLはTranslationWorkerCountとは独立にAPI同時実行数を
+        // 制限するため、常にConcurrencyLimitedTranslationServiceでラップされる。
         var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "dummy-key:fx" };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
-        Assert.IsType<DeepLTranslationService>(service);
+        var limited = Assert.IsType<ConcurrencyLimitedTranslationService>(service);
+        Assert.IsType<DeepLTranslationService>(limited.Inner);
         Assert.True(service.IsEnabled);
     }
 
     [Fact]
-    public void Ollama選択の場合はAPIキー無しでもOllamaTranslationServiceが返る()
+    public void Ollama選択の場合はConcurrencyLimitedTranslationServiceでラップされたOllamaTranslationServiceが返る()
     {
         var settings = new AppSettings { TranslationBackend = "ollama", DeepLApiKey = "" };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
-        Assert.IsType<OllamaTranslationService>(service);
+        var limited = Assert.IsType<ConcurrencyLimitedTranslationService>(service);
+        Assert.IsType<OllamaTranslationService>(limited.Inner);
         Assert.True(service.IsEnabled);
     }
 
     [Fact]
-    public void DeepLフォールバック無効の場合はDeepLTranslationServiceがそのまま返る()
+    public void DeepLフォールバック無効の場合もConcurrencyLimitedTranslationServiceでラップされたDeepLTranslationServiceが返る()
     {
         var settings = new AppSettings
         {
@@ -337,11 +343,12 @@ public class AppSettingsTests : IDisposable
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
-        Assert.IsType<DeepLTranslationService>(service);
+        var limited = Assert.IsType<ConcurrencyLimitedTranslationService>(service);
+        Assert.IsType<DeepLTranslationService>(limited.Inner);
     }
 
     [Fact]
-    public void DeepLフォールバック有効の場合はFallbackTranslationServiceでラップされる()
+    public void DeepLフォールバック有効の場合はFallbackTranslationServiceでラップされ両側ともConcurrencyLimitedTranslationServiceになる()
     {
         var settings = new AppSettings
         {
@@ -353,6 +360,56 @@ public class AppSettingsTests : IDisposable
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
         Assert.IsType<FallbackTranslationService>(service);
+    }
+
+    [Fact]
+    public async Task 翻訳ワーカー数を増やしてもDeepLへの同時リクエスト数は制限される()
+    {
+        // コードレビュー対応の要point: TranslationWorkerCountを増やしても、
+        // 実際にバックエンドへ同時に飛ぶリクエスト数はConcurrencyLimitedTranslationServiceの
+        // Semaphore上限を超えないことを確認する。DeepLTranslationServiceの実通信部分は
+        // モック化できないため、代わりに任意のITranslationServiceで同時実行数を検証する。
+        var maxObservedConcurrency = 0;
+        var currentConcurrency = 0;
+        var gate = new object();
+        var probe = new ConcurrencyProbeTranslationService(async () =>
+        {
+            lock (gate)
+            {
+                currentConcurrency++;
+                if (currentConcurrency > maxObservedConcurrency) maxObservedConcurrency = currentConcurrency;
+            }
+            await Task.Delay(50);
+            lock (gate) { currentConcurrency--; }
+        });
+
+        var limited = new ConcurrencyLimitedTranslationService(probe, new SemaphoreSlim(2));
+
+        // Semaphore上限(2)より多い4件を同時に呼び出す
+        var tasks = new[]
+        {
+            limited.TranslateAsync("a", CancellationToken.None),
+            limited.TranslateAsync("b", CancellationToken.None),
+            limited.TranslateAsync("c", CancellationToken.None),
+            limited.TranslateAsync("d", CancellationToken.None),
+        };
+        await Task.WhenAll(tasks);
+
+        Assert.True(maxObservedConcurrency <= 2,
+            $"Semaphoreの上限(2)を超えて同時実行された(観測値: {maxObservedConcurrency})");
+    }
+
+    /// <summary>上記テスト専用の、実通信を伴わないITranslationServiceのダミー実装。</summary>
+    private sealed class ConcurrencyProbeTranslationService : ITranslationService
+    {
+        private readonly Func<Task> _onTranslate;
+        public ConcurrencyProbeTranslationService(Func<Task> onTranslate) => _onTranslate = onTranslate;
+        public bool IsEnabled => true;
+        public async Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+        {
+            await _onTranslate();
+            return TranslationResult.Success(text);
+        }
     }
 
     [Fact]
