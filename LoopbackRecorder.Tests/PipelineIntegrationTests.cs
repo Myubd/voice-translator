@@ -290,18 +290,16 @@ public class PipelineIntegrationTests
             worker.TranslatedTextReceived += args => translated.Add(args);
         }
 
-        var stopwatch = Stopwatch.StartNew();
         await Task.WhenAll(workers.Select(w => w.RunAsync(CancellationToken.None)));
-        stopwatch.Stop();
 
-        // 6項目×100msを3ワーカーで並列処理すれば理論上は約200ms(6/3×100ms)で終わるはず。
-        // 直列(1ワーカー)なら600msかかる。CI環境のスケジューリング揺らぎを考慮し、
-        // 理論値ちょうどでは判定せず、緩めの上限で「並列に処理されたこと」自体を検証する。
-        // (閾値調整の経緯: 当初400msだったが、GitHub Actionsの共有ランナーが混んでいる時間帯に
-        // 419msで実測し、閾値ぎりぎりで失敗した。並列/直列を区別できればよいテストの目的からすると
-        // 400msという閾値自体が厳しすぎたため、直列の600msとは明確に区別できる範囲で500msまで緩めた)
-        Assert.True(stopwatch.ElapsedMilliseconds < 500,
-            $"並列実行されていれば500ms未満で終わるはず(実測: {stopwatch.ElapsedMilliseconds}ms)");
+        // 実行時間のしきい値(旧: 500ms未満)は、共有CIランナーの混雑度によって
+        // どんな値を設定してもいずれ揺らいで失敗する(実際に400ms→500msと緩めても
+        // 645msで再度失敗した)。壁時計時間ではなく「複数ワーカーの実行区間が
+        // 実際に重なっていたか」を直接検証することで、CI環境の速い/遅いに左右されず
+        // 安定して並列実行を確認する。
+        Assert.True(fakeService.HadOverlappingCalls,
+            $"複数ワーカーが同時に翻訳APIを呼んでいる区間が一度もなかった(並列実行になっていない可能性)。" +
+            $"呼び出し区間: {fakeService.DescribeCallWindows()}");
 
         // 重複なく・欠落なく、全6項目がちょうど1回ずつ処理されたこと
         Assert.Equal(6, fakeService.CallCount);
@@ -316,6 +314,8 @@ public class PipelineIntegrationTests
     private sealed class SlowFakeTranslationService : ITranslationService
     {
         private readonly TimeSpan _delay;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly ConcurrentBag<(long StartMs, long EndMs)> _callWindows = new();
         private int _callCount;
         public int CallCount => _callCount;
         public bool IsEnabled => true;
@@ -327,8 +327,32 @@ public class PipelineIntegrationTests
         public async Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _callCount);
+            var start = _clock.ElapsedMilliseconds;
             await Task.Delay(_delay, cancellationToken);
+            var end = _clock.ElapsedMilliseconds;
+            _callWindows.Add((start, end));
             return TranslationResult.Success($"訳:{text}");
         }
+
+        /// <summary>いずれか2件以上の呼び出し区間が時間的に重なっていれば真(=実際に並列実行された証拠)。</summary>
+        public bool HadOverlappingCalls
+        {
+            get
+            {
+                var windows = _callWindows.OrderBy(w => w.StartMs).ToList();
+                for (int i = 0; i < windows.Count; i++)
+                {
+                    for (int j = i + 1; j < windows.Count; j++)
+                    {
+                        if (windows[i].StartMs < windows[j].EndMs && windows[j].StartMs < windows[i].EndMs)
+                            return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        public string DescribeCallWindows() =>
+            string.Join(", ", _callWindows.OrderBy(w => w.StartMs).Select(w => $"[{w.StartMs}-{w.EndMs}]"));
     }
 }
