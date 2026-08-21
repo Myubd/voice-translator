@@ -296,9 +296,12 @@ public class PipelineIntegrationTests
 
         // 6項目×100msを3ワーカーで並列処理すれば理論上は約200ms(6/3×100ms)で終わるはず。
         // 直列(1ワーカー)なら600msかかる。CI環境のスケジューリング揺らぎを考慮し、
-        // 理論値ちょうどでは判定せず、緩めの上限(400ms)で「並列に処理されたこと」自体を検証する。
-        Assert.True(stopwatch.ElapsedMilliseconds < 400,
-            $"並列実行されていれば400ms未満で終わるはず(実測: {stopwatch.ElapsedMilliseconds}ms)");
+        // 理論値ちょうどでは判定せず、緩めの上限で「並列に処理されたこと」自体を検証する。
+        // (閾値調整の経緯: 当初400msだったが、GitHub Actionsの共有ランナーが混んでいる時間帯に
+        // 419msで実測し、閾値ぎりぎりで失敗した。並列/直列を区別できればよいテストの目的からすると
+        // 400msという閾値自体が厳しすぎたため、直列の600msとは明確に区別できる範囲で500msまで緩めた)
+        Assert.True(stopwatch.ElapsedMilliseconds < 500,
+            $"並列実行されていれば500ms未満で終わるはず(実測: {stopwatch.ElapsedMilliseconds}ms)");
 
         // 重複なく・欠落なく、全6項目がちょうど1回ずつ処理されたこと
         Assert.Equal(6, fakeService.CallCount);
