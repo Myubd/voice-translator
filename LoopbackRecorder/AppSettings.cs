@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 /// <summary>
 /// アプリの設定値をまとめて保持するクラス。
@@ -511,6 +512,13 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_KEY", OverlayHotkeyKey);
     }
 
+    // TranslationWorkerCountとは独立に、DeepL/Ollamaそれぞれへの同時リクエスト数を制限する
+    // 上限値(コードレビュー対応)。DeepLはクラウドAPIのレート制限を考慮して2、Ollamaは
+    // ローカルの単一モデルインスタンスへの負荷集中を避けるため1に固定している
+    // (将来的にユーザー設定にする余地はあるが、まずは固定値で様子を見る)。
+    private const int DeepLMaxConcurrentRequests = 2;
+    private const int OllamaMaxConcurrentRequests = 1;
+
     /// <summary>設定に応じた翻訳サービスを生成する。DeepLでAPIキー未設定の場合は
     /// (以前はnullを返していたが)NullTranslationService(IsEnabled=false)を返し、
     /// 呼び出し元がnullチェックをしなくても「翻訳せず文字起こしのみ」を扱えるようにする。
@@ -518,23 +526,31 @@ public partial class AppSettings
     /// EnableDeepLToOllamaFallback=trueの場合、DeepL選択時はFallbackTranslationServiceで
     /// 包み、DeepL失敗時に自動的にOllamaへ切り替えられるようにする(OllamaModel/Endpoint等は
     /// 通常のOllama設定をそのまま流用する。Ollama側が未セットアップでも、実際に使われる
-    /// (=DeepLが失敗する)まではエラーにならない)。</summary>
+    /// (=DeepLが失敗する)まではエラーにならない)。
+    ///
+    /// さらに、DeepL/Ollamaそれぞれを ConcurrencyLimitedTranslationService で包み、
+    /// TranslationWorkerCount(翻訳ワーカー数、最大4)とは独立に、バックエンドへの同時
+    /// リクエスト数を制限する(コードレビュー対応: ワーカー数=API同時実行数になっていたことで
+    /// DeepLの429/タイムアウトが連鎖しうる懸念への対応)。</summary>
     public ITranslationService CreateTranslationService(System.Net.Http.HttpClient httpClient)
     {
         var targetOption = LanguageCatalog.FindByDeepLCode(TargetLanguageCode);
 
         if (TranslationBackend.Equals("ollama", StringComparison.OrdinalIgnoreCase))
         {
-            return new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
+            var ollama = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
+            return new ConcurrencyLimitedTranslationService(ollama, new SemaphoreSlim(OllamaMaxConcurrentRequests));
         }
 
         if (!string.IsNullOrWhiteSpace(DeepLApiKey))
         {
             var deepL = new DeepLTranslationService(httpClient, DeepLApiKey, targetOption.DeepLCode);
-            if (!EnableDeepLToOllamaFallback) return deepL;
+            var limitedDeepL = new ConcurrencyLimitedTranslationService(deepL, new SemaphoreSlim(DeepLMaxConcurrentRequests));
+            if (!EnableDeepLToOllamaFallback) return limitedDeepL;
 
             var ollamaFallback = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
-            return new FallbackTranslationService(deepL, ollamaFallback);
+            var limitedOllamaFallback = new ConcurrencyLimitedTranslationService(ollamaFallback, new SemaphoreSlim(OllamaMaxConcurrentRequests));
+            return new FallbackTranslationService(limitedDeepL, limitedOllamaFallback);
         }
 
         return NullTranslationService.Instance;
