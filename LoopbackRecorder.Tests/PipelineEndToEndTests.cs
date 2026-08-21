@@ -86,9 +86,13 @@ public class PipelineEndToEndTests
             // xUnitには標準の「実行時スキップ」機能が無い(追加パッケージが必要)ため、
             // 早期returnで代用している。CI上は常にこの分岐を通り、テストは常に「成功」表示になるが、
             // 実際には何も検証していないことに注意(ログにその旨を明示する)。
-            Console.WriteLine(
+            var skipMessage =
                 $"[SKIP] テストデータ({TestDataDir})またはWhisperモデルが見つからないため、" +
-                "このテストは何も検証せずに終了します。準備方法はこのクラスのXMLコメントを参照してください。");
+                "このテストは何も検証せずに終了します。準備方法はこのクラスのXMLコメントを参照してください。";
+            Console.WriteLine(skipMessage);
+            // GitHub Actions上でログに埋もれず気づけるよう、workflow commandとしてWarning annotation
+            // を出す(::warning::で始まる行はActionsのRun summaryに表示される)。
+            Console.WriteLine($"::warning::{GetType().Name}: {skipMessage}");
             return;
         }
 

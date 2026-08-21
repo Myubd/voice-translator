@@ -19,6 +19,13 @@ namespace LoopbackRecorder.Tests;
 ///
 /// 【手動オプトイン】PipelineEndToEndTestsと同じ設計。TestData/*.wavが無い環境では何もせず
 /// 終了する(CIを壊さない)。Whisperモデルは不要(VADの確率曲線だけを比較するため)。
+///
+/// 【regression test化(レビュー対応)】導入当初はConsole.WriteLineで差分を出力するだけで、
+/// 閾値を超えてもテストは常に成功していた(=将来VAD実装を変更して確率曲線が大きく崩れても
+/// 検知できない)。そのため下記の許容閾値(<see cref="MaxAllowedMeanAbsDiff"/>等)を超えた場合は
+/// テストを失敗させるようにした。閾値は本ドキュメント作成時点の実測値
+/// (docs/vad-windowing-comparison.md: 平均差0.0115・境界差最大30ms)に対して、TTS以外の音声
+/// (小声・早口・ノイズ等)でもある程度のブレを許容できるよう余裕を持たせている。
 /// </summary>
 public class VadWindowingComparisonTests
 {
@@ -31,6 +38,14 @@ public class VadWindowingComparisonTests
 
     private const int SampleRate = 16000;
     private const int ChunkSamples = 480; // 本体(AudioPipeline.ChunkSamples)と同じ30ms周期
+
+    // === regression test用の許容閾値 ===
+    // 確率曲線の平均差。実測値0.0115の約4倍を上限とし、TTS以外の音声でのブレも許容する。
+    private const double MaxAllowedMeanAbsDiff = 0.05;
+    // 検出区間数の差。0(完全一致)を基本としつつ、境界付近の1区間分だけのブレは許容する。
+    private const int MaxAllowedSegmentCountDiff = 1;
+    // 区間境界時刻の差。実測値30ms(=1チャンク分)に対して、3チャンク分程度まで許容する。
+    private const double MaxAllowedBoundaryDiffMs = 100;
 
     [Fact]
     public void アプリ既定方式と公式ウィンドウ方式の発話確率_区間検出結果を比較する()
@@ -47,7 +62,13 @@ public class VadWindowingComparisonTests
         var wavFiles = Directory.Exists(TestDataDir) ? Directory.GetFiles(TestDataDir, "*.wav") : Array.Empty<string>();
         if (wavFiles.Length == 0 || !File.Exists(SileroModelPath))
         {
-            Console.WriteLine($"[SKIP] テストデータ({TestDataDir})またはSileroモデルが見つからないためスキップします。");
+            var skipMessage = $"[SKIP] テストデータ({TestDataDir})またはSileroモデルが見つからないためスキップします。";
+            Console.WriteLine(skipMessage);
+            // GitHub Actions上でログに埋もれず気づけるよう、workflow commandとしてWarning annotation
+            // を出す(::warning::で始まる行はActionsのRun summaryに表示される)。CI(windows-latest)は
+            // *.wavが.gitignore対象のため、現状は毎回このパスを通り、VAD窓方式の実測比較は
+            // 一度もCI上で実行されていないことに注意。
+            Console.WriteLine($"::warning::{nameof(VadWindowingComparisonTests)}: {skipMessage}");
             return;
         }
 
@@ -157,6 +178,36 @@ public class VadWindowingComparisonTests
         {
             Console.WriteLine("  ⚠ 検出区間数が一致しないため、区間ごとの境界比較はスキップします" +
                 "(区間数の違い自体が重要な結果です)。");
+        }
+
+        // === regression assertion(レビュー対応) ===
+        // これまでは上記の値をConsole.WriteLineで出力するだけで、どれだけ差が開いてもテストは
+        // 常に成功していた。今後VAD周りの実装(SileroVadDetector・VoiceActivitySegmenter)を
+        // 変更した際に、確率曲線や検出区間が大きく崩れていないことをCIで検知できるよう、
+        // 許容閾値を超えた場合はここで失敗させる。
+        Assert.True(meanAbsDiff < MaxAllowedMeanAbsDiff,
+            $"{fileName}: 確率曲線の平均差が許容値を超えています(平均差={meanAbsDiff:F4}, " +
+            $"許容値={MaxAllowedMeanAbsDiff:F4})。VAD実装の変更により、公式ウィンドウ方式との" +
+            "乖離が大きくなっていないか確認してください。");
+
+        var segmentCountDiff = Math.Abs(appSegments.Count - officialSegments.Count);
+        Assert.True(segmentCountDiff <= MaxAllowedSegmentCountDiff,
+            $"{fileName}: 検出区間数の差が許容値を超えています(アプリ既定={appSegments.Count}件, " +
+            $"公式={officialSegments.Count}件, 差={segmentCountDiff}, 許容値={MaxAllowedSegmentCountDiff})。");
+
+        if (appSegments.Count == officialSegments.Count)
+        {
+            for (int i = 0; i < appSegments.Count; i++)
+            {
+                var startDiffMs = Math.Abs((appSegments[i].StartTime - officialSegments[i].StartTime).TotalMilliseconds);
+                var endDiffMs = Math.Abs((appSegments[i].EndTime - officialSegments[i].EndTime).TotalMilliseconds);
+                Assert.True(startDiffMs <= MaxAllowedBoundaryDiffMs,
+                    $"{fileName}: 区間{i + 1}の開始時刻差が許容値を超えています" +
+                    $"(差={startDiffMs:F0}ms, 許容値={MaxAllowedBoundaryDiffMs:F0}ms)。");
+                Assert.True(endDiffMs <= MaxAllowedBoundaryDiffMs,
+                    $"{fileName}: 区間{i + 1}の終了時刻差が許容値を超えています" +
+                    $"(差={endDiffMs:F0}ms, 許容値={MaxAllowedBoundaryDiffMs:F0}ms)。");
+            }
         }
     }
 

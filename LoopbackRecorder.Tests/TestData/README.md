@@ -1,50 +1,209 @@
-# TestData フォルダ
+# Game Voice Translator (旧: Voice Translator)
 
-`PipelineEndToEndTests.cs` が使う、実音声を使ったE2Eテスト用の音声ファイルを置く場所です。
+ゲームプレイ中、Discordのボイスチャットやゲーム音声内で外国人が話す音声をリアルタイムで文字起こし・翻訳する、ゲーム用途特化のWindowsデスクトップアプリです。
 
-## 前提条件
+音声を検出 → Whisperで文字起こし → 翻訳(DeepL API またはローカルAI/Ollama)→ 画面上に表示、という流れをリアルタイムで行います。
 
-- WAVファイルを1つ以上、このフォルダに置いてください(ファイル名は自由)。
-- サンプルレート・チャンネル数は自由です(本体アプリと同様、テスト側で自動的に16kHzモノラルへ
-  変換してから検証します)。ただし3ch以上(5.1ch等)には対応していません。
-- `.wav` は `.gitignore` で除外済みなので、ここに置いたファイルは誤ってコミットされません。
+## 主な機能
 
-## 用意の仕方
+- WASAPIループバックキャプチャによる音声取得(VB-CABLEやSteelSeries Sonar等の仮想オーディオデバイスに対応)
+- Silero VAD(発話区間検出)。Sileroモデルが利用できない場合のみRMSベースの簡易VADへ自動フォールバック。発話開始前の音声を少し遡って付与する「プリロール」機能により語頭の欠落を軽減
+  - ヒステリシス対応: 発話開始時と発話継続中とで判定閾値を分け、息継ぎ等の短い音量低下によるセグメント分断を抑制(設定画面で調整可能)
+- ゲーム音声優先モード(ON時、VAD閾値を引き上げて小さい雑音より大きい音声を優先的に拾う。倍率は設定画面で調整可能)
+- [Whisper.net](https://github.com/sandrohanea/whisper.net)によるオフライン文字起こし
+  - 認識言語を「自動検出」または個別言語(英語/日本語/韓国語/中国語/スペイン語/フランス語/ドイツ語/ロシア語/ポルトガル語)から選択可能
+  - 固有名詞などの認識精度を上げるための「認識のヒント」(Whisperプロンプト)を指定可能
+  - 15秒を超える長い発話は強制的に区切られるが、区切り位置の前後を少し重ねて次のセグメントに引き継ぐことで文脈の欠落を緩和
+  - 推論に使うCPUスレッド数を設定画面から調整可能(既定値は控えめに設定。ゲームと同時実行する際のCPU負荷を抑えたい場合に減らせる)
+- 翻訳バックエンドを切り替え可能
+  - [DeepL API](https://www.deepl.com/pro-api)(クラウド、高精度)
+  - [Ollama](https://ollama.com)(ローカルAI、APIキー不要・完全オフライン)
+  - DeepL使用時、「DeepLが失敗した場合、自動的にOllamaへ切り替える」設定を有効にすると、DeepLのタイムアウト/エラー時のみ自動でOllamaへフォールバックする(Ollamaの別途セットアップが必要。成功時はOllamaを一切呼ばないため通常時の速度に影響しない)
+- 翻訳先言語を選択可能(日本語/英語/韓国語/中国語/スペイン語/フランス語/ドイツ語/ロシア語/ポルトガル語)
+- Ollama使用時、Wikipedia記事の抜粋などの「参考コンテキスト」を貼り付けておくと、認識開始時に固有名詞の対訳用語集が自動抽出され、以降の翻訳に反映される
+- 原文/訳文をタイムスタンプ付きで分けて表示するメイン画面
+- 認識完了から翻訳完了までの遅延を秒単位で表示。翻訳待ちキューが2件以上溜まっている場合は「待ち行列」件数も併せて表示し、遅延の原因が単発の重い処理かキューの詰まりかを見分けやすくしている
+- 履歴をテキスト、またはSRT字幕形式でファイルへエクスポート可能
+- 「訳文をコピー」ボタンで、訳文の履歴をワンクリックでクリップボードにコピー可能(チャットへの貼り付け等、ファイル保存よりも軽い共有向け)
+- ゲーム画面に重ねて表示できる、ドラッグ移動・リサイズ可能な半透明オーバーレイ(訳文のみ表示)
+  - 文字サイズ・背景の不透明度・最大表示行数を設定画面から調整可能(最新の発話ほど明るく強調表示)
+- グローバルホットキー対応(既定はCtrl+Alt+R: 開始/停止、Ctrl+Alt+O: オーバーレイ切り替え)。ゲームがアクティブな状態でもAlt-Tabせず操作できる。組み合わせは設定画面の「ショートカット」タブから変更可能
+- `.env`ファイルによる設定管理(数値はカルチャに依存しない形式で保存、保存はアトミック(tmp書き込み→置換)で行いクラッシュ時の破損を防止)
+- 診断ログ(`logs/app-YYYYMMDD.log`)。翻訳API呼び出しの失敗など、握りつぶさず記録が必要な例外を出力する
+- 処理が追いつかず音声セグメントが破棄された場合、件数をステータス欄に表示
 
-### 方法A: PowerShellで音声合成(TTS)を使う(推奨・お手軽)
+## 動作環境
 
-自分の声を録音する必要がなく、誰でも同じ手順で再現できます。
+- Windows 10/11
+- [.NET 8 SDK](https://dotnet.microsoft.com/download)
+
+## セットアップ
+
+### 1. リポジトリを取得
 
 ```powershell
-Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SetOutputToWaveFile("C:\path\to\LoopbackRecorder.Tests\TestData\sample1.wav")
-$synth.Speak("こんにちは、今日はいい天気ですね。")
-Start-Sleep -Milliseconds 1500
-$synth.Speak("それではゲームを始めましょう。")
-$synth.Dispose()
+git clone https://github.com/Myubd/voice-translator.git
+cd voice-translator/LoopbackRecorder
 ```
 
-### 方法B: 自分の声を録音する
+以降の手順(モデル配置・`.env`作成・ビルド)はすべて、上記の`LoopbackRecorder`フォルダ(`.csproj`と同じ階層)の中で行います。
+(リポジトリ直下には本体プロジェクト`LoopbackRecorder/`と、単体テストプロジェクト`LoopbackRecorder.Tests/`が兄弟フォルダとして並んでおり、アプリ自体のビルド・実行には後者は不要です。)
 
-Windows標準の「サウンドレコーダー」アプリ、または [Audacity](https://www.audacityteam.org/)(無料)で、
-2〜4秒の発話を1秒以上の無音を挟んで3〜5個ほど収録してください。書き出し時のサンプルレート・
-チャンネル数を気にする必要はありません(そのままエクスポートしてOK)。
+### 2. Whisperモデルをダウンロード
 
-## Whisperモデルについて
+[huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)から `ggml-base.bin` をダウンロードし、`LoopbackRecorder`フォルダ(`.csproj`と同じ階層)に配置してください。
 
-このテストは、`LoopbackRecorder/`(本体プロジェクトフォルダ)にある `ggml-*.bin` を自動的に探して使います。
-普段アプリを動かすために既に配置しているモデルがあれば、追加の準備は不要です。
-特定のモデルを指定したい場合は、環境変数 `E2E_WHISPER_MODEL_PATH` に絶対パスを設定してください。
+より高精度な認識が必要な場合は `ggml-small.bin` 等も利用できます(設定画面から切り替え可能)。
 
-Silero VADモデル(`silero_vad.onnx`)は小さいため本体プロジェクトフォルダに同梱済みで、準備不要です。
+### 3. `.env`ファイルを作成
 
-## 実行方法
+`.env.example` を `.env` にコピーし、内容を編集します。
 
+```powershell
+copy .env.example .env
 ```
+
+```env
+# 音声デバイス名に含まれるキーワード(例: CABLE, Chat)
+DEVICE_KEYWORD=Chat
+
+# VAD(発話検出)の閾値。Silero VADの発話確率(0.0〜1.0)のスケール
+VAD_THRESHOLD=0.5
+
+# VADヒステリシス比率(0〜1)。発話継続中の判定閾値をVAD_THRESHOLDからどれだけ下げるか
+VAD_HYSTERESIS_RATIO=0.6
+
+# ゲーム音声優先モード(小さい雑音より大きい音声を優先的に拾う)
+GAME_AUDIO_PRIORITY_MODE=False
+
+# ゲーム音声優先モードON時にVAD閾値へ掛ける倍率
+GAME_AUDIO_PRIORITY_MULTIPLIER=1.5
+
+# オーバーレイの見た目
+OVERLAY_FONT_SIZE=22
+OVERLAY_OPACITY=0.7
+OVERLAY_MAX_LINES=4
+
+# 使用するWhisperモデルファイル名
+WHISPER_MODEL_PATH=ggml-base.bin
+
+# Whisper推論に使うスレッド数(1〜論理コア数)。設定画面の「エンジン」タブからも調整可能。
+# 大きいほど文字起こしは速くなるが、ゲームなど他アプリのCPU負荷に影響しやすくなる
+WHISPER_THREAD_COUNT=2
+
+# Whisperに渡す認識ヒント(固有名詞など。カンマ区切りで自由に記述)
+WHISPER_PROMPT=
+
+# 認識言語(Whisperコード。例: auto, en, ja, ko, zh)
+RECOGNITION_LANGUAGE=auto
+
+# 翻訳先言語(DeepLコード。例: JA, EN-US, KO, ZH)
+TARGET_LANGUAGE_CODE=JA
+
+# 翻訳バックエンド: "deepl" または "ollama"
+TRANSLATION_BACKEND=deepl
+
+# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)
+DEEPL_API_KEY=
+
+# Ollama(ローカルAI)を使う場合に使用するモデル名
+OLLAMA_MODEL=llama3.1
+
+# Ollamaのエンドポイント(通常は変更不要)
+OLLAMA_ENDPOINT=http://localhost:11434
+
+# Ollama使用時、翻訳の背景知識として渡す参考コンテキスト(改行は\nでエスケープ済み)
+OLLAMA_CONTEXT=
+
+# グローバルショートカットキー(設定画面の「ショートカット」タブから変更可能)
+START_STOP_HOTKEY_MODIFIERS=Control, Alt
+START_STOP_HOTKEY_KEY=R
+OVERLAY_HOTKEY_MODIFIERS=Control, Alt
+OVERLAY_HOTKEY_KEY=O
+```
+
+DeepLを使う場合は[deepl.com/pro-api](https://www.deepl.com/pro-api)で無料APIキーを取得してください。
+
+Ollama(ローカルAI)を使う場合は、[ollama.com](https://ollama.com)をインストールし、任意のモデルを取得しておいてください。
+
+```powershell
+ollama pull llama3.1
+```
+
+これらの項目はすべて起動後の「設定」画面からも変更・保存できるため、`.env`を直接編集する必要は基本的にありません。
+
+### 4. ビルド・実行
+
+```powershell
+dotnet restore
+dotnet run
+```
+
+## 使い方
+
+1. アプリを起動し、「設定」ボタンから各種設定を行って保存する
+   - **音声**: 音声デバイス・VAD感度・ゲーム音声優先モード
+   - **エンジン**: Whisperモデル・翻訳バックエンド(DeepL/Ollama)・APIキーやOllamaのモデル名/エンドポイント
+   - **言語**: 認識のヒント・認識言語(原文)・翻訳先言語(訳文)・(Ollama使用時)参考コンテキスト
+   - **オーバーレイ**: 文字サイズ・背景の不透明度・最大表示行数
+   - **ショートカット**: グローバルホットキー(開始/停止・オーバーレイ切り替え)の割り当て変更
+2. 「翻訳開始」ボタンで認識を開始(Ollama使用時、参考コンテキストが設定されていれば開始時に用語集の抽出が走る)
+3. 左ペインに原文、右ペインに訳文が、それぞれ検出時刻付きでリアルタイムに表示される
+4. 「オーバーレイ表示」で、ゲーム画面に重ねられる半透明の訳文ウィンドウを表示/非表示できる(ドラッグで移動、端をつまんでリサイズ可能)。最新の発話ほど明るく強調表示される
+5. 「履歴クリア」で表示内容をリセット
+6. 「履歴を保存」で、それまでの原文/訳文をテキストファイル、または訳文のみのSRT字幕ファイルとして書き出せる(SRTのタイムスタンプは実際の発話区間(Whisperの認識結果に基づく秒単位のタイムスタンプ)を使用します)
+7. グローバルホットキー(既定はCtrl+Alt+Rで開始/停止、Ctrl+Alt+Oでオーバーレイ切り替え)で、ウィンドウを操作せずに操作可能(他アプリと組み合わせが競合する場合は動作しないことがあります)。組み合わせは設定画面の「ショートカット」タブから変更できます
+
+## 参考コンテキスト(用語集)機能について
+
+Ollamaバックエンド使用時のみ、設定画面の「翻訳」タブにある「参考コンテキスト」欄に、今回聞く音声に関連するWikipedia記事などの抜粋を貼り付けておくことができます。
+
+- 認識開始時に一度だけ、貼り付けた文章から固有名詞・地名・専門用語とその訳語をコンパクトな用語集として抽出します
+- 以降の翻訳では、この用語集のみを毎回のプロンプトに添えます(元の文章全体は毎回送らないため、翻訳ごとのレイテンシは増えません)
+- 「文章に実際に登場した用語の対訳としてのみ使う」よう明示しており、文脈から存在しない情報を補完しないようにしています
+
+## GPU推論について
+
+現状の既定ビルドはCPU推論([Whisper.net.Runtime](https://github.com/sandrohanea/whisper.net)のCPU版)を使用しています。GPU(CUDA)推論に切り替えたい場合は、`.csproj`の`Whisper.net.Runtime`パッケージ参照を`Whisper.net.Runtime.Cuda`に差し替えたうえで、対応するCUDA Toolkit/cuDNNを別途インストールする必要があります(詳細は[Whisper.netのREADME](https://github.com/sandrohanea/whisper.net#gpu-support)を参照)。GPU推論を使う場合、上記の`WHISPER_THREAD_COUNT`(CPUスレッド数)の影響は小さくなります。
+
+## 音声デバイスについて
+
+ゲーム音声やDiscordのボイスチャットをキャプチャするには、仮想オーディオデバイス(例: [VB-CABLE](https://vb-audio.com/Cable/))を経由させる必要があります。SteelSeries Sonar等のオーディオミキサーソフトを使っている場合、チャンネルごとの出力先をVB-CABLEに向けることで、特定の音声(チャットのみ等)を分離してキャプチャできます。
+
+設定画面の「音声デバイス」では、デバイス名に含まれるキーワード(例: `CABLE`)で対象デバイスを指定します。
+
+## 技術スタック
+
+- C# / .NET 8 / WPF
+- [NAudio](https://github.com/naudio/NAudio) — 音声キャプチャ・リサンプリング
+- [Whisper.net](https://github.com/sandrohanea/whisper.net) — 音声認識(whisper.cppのC#バインディング)
+- [DeepL API](https://www.deepl.com/pro-api) / [Ollama](https://ollama.com) — 翻訳
+
+## テスト
+
+VAD(発話区間検出)のロジックは`LoopbackRecorder.Tests`(xUnit)で単体テストされています。WPF本体とは別プロジェクトなので、テストの実行にはビルド済みの本体アプリは不要です。
+
+```powershell
 cd LoopbackRecorder.Tests
-dotnet test --filter "実音声ファイルからVADと文字起こしの結線が動作する"
+dotnet test
 ```
 
-音声ファイルまたはWhisperモデルが見つからない場合、このテストは何も検証せずに(常に成功扱いで)
-終了します。コンソール出力に `[SKIP]` と表示されていないか確認してください。
+**注意: `PipelineEndToEndTests`(E2Eテスト)は、Whisperモデル(`ggml-*.bin`)がリポジトリに
+含まれない(サイズが大きいため`.gitignore`対象)ことから、GitHub Actions(CI)上では常にスキップされ、
+`dotnet test`の結果は「成功」と表示されますが実際には何も検証していません。**
+一方`VadWindowingComparisonTests`(Silero VADのウィンドウ方式A/B比較)は、テスト音声
+(`LoopbackRecorder.Tests/TestData/*.wav`)を`generate-test-audio.ps1`で生成してコミットしておけば
+CI上でも実行されます(`.gitignore`はこのフォルダの`.wav`のみ例外的に追跡対象にしています。
+詳しくは`LoopbackRecorder.Tests/TestData/README.md`参照)。E2Eテストをローカルで確認したい場合は、
+同READMEの手順でテスト音声とWhisperモデルを用意し、`dotnet test`をローカルで実行してください
+(スキップされた場合はコンソールに`[SKIP]`と表示されます)。
+
+## 既知の制限
+
+- ノイズが多い・早口な音声(ゲーム実況等)では、Whisperが稀に無関係な言語のテキストを生成すること(ハルシネーション)がある
+- 一部の仮想オーディオデバイス(SteelSeries Sonarの仮想チャンネル等)はWASAPIループバックキャプチャと相性が悪く、無音として扱われる場合がある(VB-CABLE経由での利用を推奨)。なお2chを超える多チャンネル出力(5.1ch等)自体は全チャンネル平均でモノラル化して処理する
+- デバイスが他プロセスと競合し、起動時にエラーになることがある(自動リトライあり)
+- 発話が途切れずに続く長文では、無音区間の検出タイミングで文の途中が別のセグメントに分割されることがあり、文脈が失われて誤訳の原因になる場合がある(15秒の強制分割時は前後を少し重ねて引き継ぐ緩和策あり)
+- SRTエクスポート・翻訳失敗行の対応付けは同一セッション(1回の開始〜停止)を前提としており、履歴をクリアせず複数回開始/停止を繰り返した場合、2回目以降のセッション分はタイムスタンプが0から再スタートする(エクスポート前に履歴をクリアするか、セッションごとにエクスポートすることを推奨)
+- 発話が非常に速く連続する場合、文字起こしの処理が追いつかず、古いセグメントが破棄されることがある(表示の遅延がどこまでも蓄積しないための仕様。破棄が発生した場合はステータス欄に件数を表示)
+- グローバルホットキーはWindowsのRegisterHotKey APIを利用しているため、他アプリが同じキー組み合わせを既に使っている場合は登録に失敗する(失敗したショートカットのみボタン操作のみ利用可能になり、もう一方は影響を受けない)。登録に失敗した場合はステータス欄に表示される

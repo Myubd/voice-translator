@@ -188,6 +188,16 @@ cd LoopbackRecorder.Tests
 dotnet test
 ```
 
+**注意: `PipelineEndToEndTests`(E2Eテスト)は、Whisperモデル(`ggml-*.bin`)がリポジトリに
+含まれない(サイズが大きいため`.gitignore`対象)ことから、GitHub Actions(CI)上では常にスキップされ、
+`dotnet test`の結果は「成功」と表示されますが実際には何も検証していません。**
+一方`VadWindowingComparisonTests`(Silero VADのウィンドウ方式A/B比較)は、テスト音声
+(`LoopbackRecorder.Tests/TestData/*.wav`)を`generate-test-audio.ps1`で生成してコミットしておけば
+CI上でも実行されます(`.gitignore`はこのフォルダの`.wav`のみ例外的に追跡対象にしています。
+詳しくは`LoopbackRecorder.Tests/TestData/README.md`参照)。E2Eテストをローカルで確認したい場合は、
+同READMEの手順でテスト音声とWhisperモデルを用意し、`dotnet test`をローカルで実行してください
+(スキップされた場合はコンソールに`[SKIP]`と表示されます)。
+
 ## 既知の制限
 
 - ノイズが多い・早口な音声(ゲーム実況等)では、Whisperが稀に無関係な言語のテキストを生成すること(ハルシネーション)がある

@@ -14,6 +14,11 @@ ggml-*.bin
 
 # 録音した音声ファイル(テスト時に生成されたもの)
 *.wav
+# ただし、VAD/E2Eテスト用に意図的に用意した音声(TTS合成・匿名)は例外的に追跡する。
+# TestData/README.mdの手順(PowerShellのSystem.Speech合成、または generate-test-audio.ps1)で
+# 生成したファイルのみをここに置くこと。実際のゲーム音源・配信録音・Discord通話の抜粋など、
+# 権利や個人情報の懸念があるものは絶対に置かないこと。
+!LoopbackRecorder.Tests/TestData/*.wav
 
 # アプリ実行時に生成されるログ(例外のスタックトレースやDeepL/Ollamaのエラーレスポンス本文、
 # 会話の断片が含まれ得るため、git add . 等での誤コミットを防ぐ)
