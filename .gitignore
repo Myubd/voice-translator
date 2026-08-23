@@ -9,6 +9,9 @@ obj/
 # APIキーなど秘密情報(.env.exampleだけコミットする)
 .env
 
+# ゲームプロファイル(参考コンテキスト等、ユーザーが入力した内容を含むため個人ごとに異なる)
+game_profiles.json
+
 # Whisperモデルファイル(数百MB〜数GBあるため、Gitではなく各自でダウンロードする運用にする)
 ggml-*.bin
 

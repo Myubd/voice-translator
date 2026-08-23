@@ -36,6 +36,18 @@
             <Setter Property="FontWeight" Value="Bold"/>
         </Style>
 
+        <!-- 「履歴クリア」専用。取り消せない操作であることが分かるよう、ホバー時だけ赤みを
+             帯びさせている(常時赤くすると他の操作ボタンから浮いて見えるため、ホバー時のみに留めた) -->
+        <Style x:Key="DestructiveIconButton" TargetType="Button" BasedOn="{StaticResource IconButton}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#3a1f1f"/>
+                    <Setter Property="BorderBrush" Value="#8a3a3a"/>
+                    <Setter Property="Foreground" Value="#ffb3b3"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
         <LinearGradientBrush x:Key="PanelGradient" StartPoint="0,0" EndPoint="0,1">
             <GradientStop Color="#1c1c28" Offset="0"/>
             <GradientStop Color="#16161f" Offset="1"/>
@@ -64,7 +76,7 @@
                             <TextBlock Text="設定"/>
                         </StackPanel>
                     </Button>
-                    <Button x:Name="ClearButton" Style="{StaticResource IconButton}" Width="110" Margin="8,0,0,0" Click="ClearButton_Click">
+                    <Button x:Name="ClearButton" Style="{StaticResource DestructiveIconButton}" Width="110" Margin="8,0,0,0" Click="ClearButton_Click">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE74D;" Margin="0,0,6,0"/>
                             <TextBlock Text="履歴クリア"/>
@@ -112,18 +124,36 @@
                     <Border DockPanel.Dock="Top" CornerRadius="10,10,0,0" Background="#22222f" Padding="12,10">
                         <TextBlock Text="原文" FontWeight="Bold" Foreground="White"/>
                     </Border>
-                    <ListBox x:Name="OriginalListBox" Background="Transparent" Foreground="#b0b0b8"
-                             BorderThickness="0" FontSize="14" Padding="8">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock TextWrapping="Wrap">
-                                    <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
-                                    <LineBreak/>
-                                    <Run Text="{Binding Text}" Foreground="#b0b0b8"/>
-                                </TextBlock>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
+                    <Grid>
+                        <ListBox x:Name="OriginalListBox" Background="Transparent" Foreground="#b0b0b8"
+                                 BorderThickness="0" FontSize="14" Padding="8">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock TextWrapping="Wrap">
+                                        <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
+                                        <LineBreak/>
+                                        <Run Text="{Binding Text}" Foreground="#b0b0b8"/>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <!-- 履歴が空の間だけ表示するプレースホルダー。IsHitTestVisible=Falseで、
+                             下のListBoxへのクリック等の操作を妨げないようにしている -->
+                        <TextBlock Text="音声を検知すると、ここに文字起こし結果が表示されます" IsHitTestVisible="False"
+                                   Foreground="#4a4a55" FontSize="13" TextWrapping="Wrap" TextAlignment="Center"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding HasItems, ElementName=OriginalListBox}" Value="False">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Grid>
                 </DockPanel>
             </Border>
 
@@ -133,18 +163,34 @@
                     <Border DockPanel.Dock="Top" CornerRadius="10,10,0,0" Background="#22222f" Padding="12,10">
                         <TextBlock Text="訳文" FontWeight="Bold" Foreground="White"/>
                     </Border>
-                    <ListBox x:Name="TranslatedListBox" Background="Transparent" Foreground="#ffffff"
-                             BorderThickness="0" FontSize="14" Padding="8">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock TextWrapping="Wrap">
-                                    <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
-                                    <LineBreak/>
-                                    <Run Text="{Binding Text}" Foreground="#ffffff"/>
-                                </TextBlock>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
+                    <Grid>
+                        <ListBox x:Name="TranslatedListBox" Background="Transparent" Foreground="#ffffff"
+                                 BorderThickness="0" FontSize="14" Padding="8">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock TextWrapping="Wrap">
+                                        <Run Text="{Binding Timestamp}" Foreground="#777780" FontSize="11"/>
+                                        <LineBreak/>
+                                        <Run Text="{Binding Text}" Foreground="#ffffff"/>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <TextBlock Text="翻訳結果がここに表示されます" IsHitTestVisible="False"
+                                   Foreground="#4a4a55" FontSize="13" TextWrapping="Wrap" TextAlignment="Center"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding HasItems, ElementName=TranslatedListBox}" Value="False">
+                                            <Setter Property="Visibility" Value="Visible"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </Grid>
                 </DockPanel>
             </Border>
         </Grid>

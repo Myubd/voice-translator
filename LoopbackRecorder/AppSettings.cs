@@ -34,6 +34,12 @@ public partial class AppSettings
     /// 既定はfalse: Ollama未セットアップの環境でDeepLのみ使っているユーザーに対して、
     /// 意図せずOllamaへの接続を試みてエラーログが増える等の副作用が出ないようにするため。</summary>
     public bool EnableDeepLToOllamaFallback { get; set; } = false;
+
+    /// <summary>trueの場合、翻訳済みの原文(完全一致)をメモリ上にキャッシュし、
+    /// 同じ原文が再度来た場合はAPI呼び出しを行わずキャッシュ済みの訳文を返す
+    /// (CachingTranslationService)。「gg」「nice」等の短い定型句の繰り返しでの
+    /// API消費量・応答時間を削減する目的で、既定はtrue(副作用が無いため)。</summary>
+    public bool EnableTranslationCache { get; set; } = true;
     public string WhisperModelPath { get; set; } = "ggml-base.bin";
 
     /// <summary>Whisper推論に使うスレッド数。以前はEnvironment.ProcessorCount / 2固定だったが、
@@ -95,6 +101,11 @@ public partial class AppSettings
 
     /// <summary>Ollama使用時、翻訳の背景知識として渡す参考コンテキスト(記事の抜粋など)</summary>
     public string OllamaContext { get; set; } = "";
+
+    /// <summary>Ollama使用時、ユーザーが直接入力する手動用語集("original => translation"形式、
+    /// 1行1エントリ)。参考コンテキストからのLLM自動抽出と異なりネットワーク呼び出しを伴わず、
+    /// 確実にその表記で翻訳に反映される。同じ原文が自動抽出側にもあった場合はこちらが優先される。</summary>
+    public string ManualGlossary { get; set; } = "";
 
     // ==== グローバルショートカットキー ====
     // ModifierKeys/Keyの各Enum名(例: "Control, Alt" / "R")をそのまま文字列として保存する。
@@ -206,6 +217,10 @@ public partial class AppSettings
         {
             settings.EnableDeepLToOllamaFallback = fallbackEnabled;
         }
+        if (bool.TryParse(Environment.GetEnvironmentVariable("ENABLE_TRANSLATION_CACHE"), out var translationCacheEnabled))
+        {
+            settings.EnableTranslationCache = translationCacheEnabled;
+        }
         if (float.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER"),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var priorityMultiplier))
         {
@@ -238,6 +253,7 @@ public partial class AppSettings
         settings.TargetLanguageCode = Environment.GetEnvironmentVariable("TARGET_LANGUAGE_CODE") ?? "JA";
         // 改行のエスケープ(\n → 改行)はEnvLoader側で共通処理済み
         settings.OllamaContext = Environment.GetEnvironmentVariable("OLLAMA_CONTEXT") ?? "";
+        settings.ManualGlossary = Environment.GetEnvironmentVariable("MANUAL_GLOSSARY") ?? "";
         settings.OllamaEndpoint = NormalizeEndpoint(settings.OllamaEndpoint);
 
         settings.StartStopHotkeyModifiers = Environment.GetEnvironmentVariable("START_STOP_HOTKEY_MODIFIERS") ?? "Control, Alt";
@@ -352,6 +368,7 @@ public partial class AppSettings
         // WHISPER_PROMPTはUIのTextBox自体はAcceptsReturn=Falseだが、貼り付けで
         // 改行が入るケースもあるため、参考コンテキストと同様にエスケープしておく
         var escapedContext = OllamaContext.Replace("\r\n", "\n").Replace("\n", "\\n");
+        var escapedManualGlossary = ManualGlossary.Replace("\r\n", "\n").Replace("\n", "\\n");
         var escapedPrompt = WhisperPrompt.Replace("\r\n", "\n").Replace("\n", "\\n");
         OllamaEndpoint = NormalizeEndpoint(OllamaEndpoint);
         var encryptResult = EncryptDeepLApiKey(DeepLApiKey);
@@ -440,6 +457,10 @@ public partial class AppSettings
             "# (TRANSLATION_BACKEND=deeplの場合のみ有効。Ollamaのセットアップが別途必要)",
             $"ENABLE_DEEPL_TO_OLLAMA_FALLBACK={EnableDeepLToOllamaFallback}",
             "",
+            "# trueの場合、翻訳済みの原文(完全一致)をメモリ上にキャッシュし、",
+            "# 同じ短い定型句等が繰り返された際にAPI呼び出しを省略する",
+            $"ENABLE_TRANSLATION_CACHE={EnableTranslationCache}",
+            "",
             "# DeepLを使う場合のAPIキー(無料プランは末尾に :fx が付く)。",
             "# Windows DPAPIで暗号化して保存しているため、このファイルを他PC/他ユーザーへ",
             "# コピーしても復号できない(このPC・このWindowsユーザーでのみ有効)。",
@@ -455,6 +476,10 @@ public partial class AppSettings
             "",
             "# Ollama使用時、翻訳の背景知識として渡す参考コンテキスト(改行は\\nでエスケープ済み)",
             $"OLLAMA_CONTEXT={escapedContext}",
+            "",
+            "# Ollama使用時、ユーザーが直接入力する手動用語集(\"original => translation\"形式、",
+            "# 1行1エントリ。改行は\\nでエスケープ済み。同じ原文が参考コンテキストの自動抽出側にもあった場合はこちらが優先される)",
+            $"MANUAL_GLOSSARY={escapedManualGlossary}",
             "",
             "# グローバルショートカットキー(設定画面の「ショートカット」タブから変更可能)",
             $"START_STOP_HOTKEY_MODIFIERS={StartStopHotkeyModifiers}",
@@ -503,9 +528,11 @@ public partial class AppSettings
             Environment.SetEnvironmentVariable("DEEPL_API_KEY_ENC", encryptResult.Status == EncryptStatus.Encrypted ? encryptResult.Value : "");
             Environment.SetEnvironmentVariable("DEEPL_API_KEY", encryptResult.Status == EncryptStatus.Encrypted ? "" : encryptResult.Value);
         }
+        Environment.SetEnvironmentVariable("ENABLE_TRANSLATION_CACHE", EnableTranslationCache.ToString());
         Environment.SetEnvironmentVariable("OLLAMA_MODEL", OllamaModel);
         Environment.SetEnvironmentVariable("OLLAMA_ENDPOINT", OllamaEndpoint);
         Environment.SetEnvironmentVariable("OLLAMA_CONTEXT", escapedContext);
+        Environment.SetEnvironmentVariable("MANUAL_GLOSSARY", escapedManualGlossary);
         Environment.SetEnvironmentVariable("START_STOP_HOTKEY_MODIFIERS", StartStopHotkeyModifiers);
         Environment.SetEnvironmentVariable("START_STOP_HOTKEY_KEY", StartStopHotkeyKey);
         Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_MODIFIERS", OverlayHotkeyModifiers);
@@ -538,21 +565,28 @@ public partial class AppSettings
 
         if (TranslationBackend.Equals("ollama", StringComparison.OrdinalIgnoreCase))
         {
-            var ollama = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
-            return new ConcurrencyLimitedTranslationService(ollama, new SemaphoreSlim(OllamaMaxConcurrentRequests));
+            var ollama = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext, ManualGlossary);
+            var limitedOllama = new ConcurrencyLimitedTranslationService(ollama, new SemaphoreSlim(OllamaMaxConcurrentRequests));
+            return WithCache(limitedOllama);
         }
 
         if (!string.IsNullOrWhiteSpace(DeepLApiKey))
         {
             var deepL = new DeepLTranslationService(httpClient, DeepLApiKey, targetOption.DeepLCode);
             var limitedDeepL = new ConcurrencyLimitedTranslationService(deepL, new SemaphoreSlim(DeepLMaxConcurrentRequests));
-            if (!EnableDeepLToOllamaFallback) return limitedDeepL;
+            if (!EnableDeepLToOllamaFallback) return WithCache(limitedDeepL);
 
-            var ollamaFallback = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext);
+            var ollamaFallback = new OllamaTranslationService(httpClient, OllamaModel, OllamaEndpoint, targetOption.EnglishName, OllamaContext, ManualGlossary);
             var limitedOllamaFallback = new ConcurrencyLimitedTranslationService(ollamaFallback, new SemaphoreSlim(OllamaMaxConcurrentRequests));
-            return new FallbackTranslationService(limitedDeepL, limitedOllamaFallback);
+            return WithCache(new FallbackTranslationService(limitedDeepL, limitedOllamaFallback));
         }
 
         return NullTranslationService.Instance;
     }
+
+    /// <summary>EnableTranslationCache設定に応じて、翻訳サービスをCachingTranslationServiceで
+    /// 包むかどうかを切り替える。NullTranslationService(翻訳無効時)はそもそもTranslateAsyncが
+    /// 呼ばれないため、ここを通す対象に含めていない。</summary>
+    private ITranslationService WithCache(ITranslationService service)
+        => EnableTranslationCache ? new CachingTranslationService(service) : service;
 }

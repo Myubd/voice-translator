@@ -41,6 +41,34 @@
             <GradientStop Color="#7B5FE0" Offset="1"/>
         </LinearGradientBrush>
 
+        <!-- MainWindowのPrimaryButton/AccentGradientと同じ配色に揃えている(アプリ全体で
+             「主要な決定操作」の色を統一するため)。設定画面では保存ボタンのみに使う。
+             上のAccentGradientより後ろに置くこと(ControlTemplate内でTemplateBinding経由の
+             Background参照が絡む場合、前方参照だとWPF側でうまく解決されずクラッシュすることがある)。 -->
+        <Style x:Key="PrimarySaveButton" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentGradient}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Opacity" Value="0.85"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Opacity" Value="0.7"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="SectionLabel" TargetType="TextBlock">
             <Setter Property="Foreground" Value="#4da6ff"/>
             <Setter Property="FontSize" Value="11"/>
@@ -87,10 +115,24 @@
     <DockPanel Margin="16">
         <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
             <Button Content="キャンセル" Width="90" Height="30" Click="CancelButton_Click"/>
-            <Button Content="保存" Width="90" Height="30" Margin="8,0,0,0" Click="SaveButton_Click"/>
+            <Button x:Name="SaveButton" Style="{StaticResource PrimarySaveButton}" Content="保存" Width="100" Height="32"
+                    Margin="8,0,0,0" Click="SaveButton_Click"/>
         </StackPanel>
-        <TextBlock x:Name="StatusText" DockPanel.Dock="Bottom" Text="" Foreground="#ffaa66" FontSize="11"
-                   TextWrapping="Wrap" Margin="0,8,0,0"/>
+
+        <!-- エラー・警告メッセージ用のアラートボックス。中身が空の間はCollapsedにし、
+             メッセージがセットされた時だけ表示する(SetStatusMessage経由で両方を連動させる)。
+             どの操作も「1つの汎用メッセージ欄」を使い回しているため(Ollama接続エラー、
+             ショートカットキーの重複、リンクを開けない等)、種別ごとの出し分けはせず
+             すべて同じ見た目の警告色で統一している。 -->
+        <Border x:Name="StatusMessageBanner" DockPanel.Dock="Bottom" Background="#3a1f1f" BorderBrush="#8a3a3a"
+                BorderThickness="1" CornerRadius="6" Padding="10,8" Margin="0,8,0,0" Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="&#xE7BA;" FontFamily="Segoe MDL2 Assets" Foreground="#ff8a8a"
+                           Margin="0,0,8,0" VerticalAlignment="Top"/>
+                <TextBlock x:Name="StatusText" Text="" Foreground="#ffb3b3" FontSize="12"
+                           TextWrapping="Wrap" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
 
         <!-- 翻訳実行中に設定を開いた場合のみ表示。ここでの変更(モデル名・APIキー等)は
              実行中のパイプラインには即座に反映されないため、その旨を明示する -->
@@ -111,6 +153,8 @@
                              Tag="&#xE774;" Content="言語" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavOverlay" GroupName="Nav" Style="{StaticResource NavButton}"
                              Tag="&#xE7F4;" Content="オーバーレイ" Checked="Nav_Checked"/>
+                <RadioButton x:Name="NavProfiles" GroupName="Nav" Style="{StaticResource NavButton}"
+                             Tag="&#xE8FD;" Content="ゲームプロファイル" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavShortcuts" GroupName="Nav" Style="{StaticResource NavButton}"
                              Tag="&#xE765;" Content="ショートカット" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavAbout" GroupName="Nav" Style="{StaticResource NavButton}"
@@ -192,7 +236,8 @@
 
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <TextBlock Text="Whisperスレッド数" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
-                            <TextBlock Text="{Binding ElementName=WhisperThreadCountSlider, Path=Value, StringFormat='{}{0:F0}'}"/>
+                            <TextBlock Foreground="#4da6ff" FontWeight="Bold"
+                                       Text="{Binding ElementName=WhisperThreadCountSlider, Path=Value, StringFormat='{}{0:F0}'}"/>
                         </StackPanel>
                         <!-- MaximumはCPUの論理コア数に応じて実行時にコードビハインドから設定する(SettingsWindow.xaml.cs参照) -->
                         <Slider x:Name="WhisperThreadCountSlider" Minimum="1" Maximum="16"
@@ -202,7 +247,8 @@
 
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <TextBlock Text="翻訳ワーカー数" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
-                            <TextBlock Text="{Binding ElementName=TranslationWorkerCountSlider, Path=Value, StringFormat='{}{0:F0}'}"/>
+                            <TextBlock Foreground="#4da6ff" FontWeight="Bold"
+                                       Text="{Binding ElementName=TranslationWorkerCountSlider, Path=Value, StringFormat='{}{0:F0}'}"/>
                         </StackPanel>
                         <Slider x:Name="TranslationWorkerCountSlider" Minimum="1" Maximum="4"
                                 TickFrequency="1" IsSnapToTickEnabled="True" Margin="0,0,0,4"/>
@@ -211,7 +257,8 @@
 
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                             <TextBlock Text="最大許容遅延(秒)" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
-                            <TextBlock Text="{Binding ElementName=MaxLatencySecondsSlider, Path=Value, StringFormat='{}{0:F1}秒'}"/>
+                            <TextBlock Foreground="#4da6ff" FontWeight="Bold"
+                                       Text="{Binding ElementName=MaxLatencySecondsSlider, Path=Value, StringFormat='{}{0:F1}秒'}"/>
                         </StackPanel>
                         <Slider x:Name="MaxLatencySecondsSlider" Minimum="0" Maximum="10" TickFrequency="0.5"
                                 IsSnapToTickEnabled="True" Margin="0,0,0,4"/>
@@ -220,10 +267,15 @@
 
                         <TextBlock Text="翻訳エンジン" Style="{StaticResource SectionLabel}"/>
                         <TextBlock Text="翻訳バックエンド" Style="{StaticResource FieldLabel}"/>
-                        <ComboBox x:Name="BackendComboBox" Margin="0,0,0,16" SelectionChanged="BackendComboBox_SelectionChanged">
+                        <ComboBox x:Name="BackendComboBox" Margin="0,0,0,4" SelectionChanged="BackendComboBox_SelectionChanged">
                             <ComboBoxItem Content="DeepL API(クラウド)" Tag="deepl"/>
                             <ComboBoxItem Content="Ollama(ローカルAI)" Tag="ollama"/>
                         </ComboBox>
+
+                        <CheckBox x:Name="TranslationCacheCheckBox"
+                                  Content="同じ原文の翻訳結果をキャッシュする" Foreground="#cccccc" Margin="0,0,0,4"/>
+                        <TextBlock Text="「gg」「nice」等の短い定型句が繰り返された場合、2回目以降はAPI呼び出しを省略して即座に表示します(完全に同じ文字列の場合のみ)"
+                                   Style="{StaticResource HelpText}" Margin="0,0,0,16"/>
 
                         <StackPanel x:Name="DeepLPanel">
                             <TextBlock Text="DeepL APIキー" Style="{StaticResource FieldLabel}"/>
@@ -244,7 +296,7 @@
                                               Unchecked="DeepLApiKeyVisibilityToggle_Unchecked"/>
                             </Grid>
                             <CheckBox x:Name="DeepLToOllamaFallbackCheckBox"
-                                      Content="DeepLが失敗した場合、自動的にOllamaへ切り替える" Margin="0,0,0,4"
+                                      Content="DeepLが失敗した場合、自動的にOllamaへ切り替える" Foreground="#cccccc" Margin="0,0,0,4"
                                       Checked="DeepLToOllamaFallbackCheckBox_CheckedChanged"
                                       Unchecked="DeepLToOllamaFallbackCheckBox_CheckedChanged"/>
                             <TextBlock Text="Ollamaが別途セットアップ済みの場合のみ有効にしてください。下のOllama設定(モデル名・エンドポイント)がフォールバック先としてそのまま使われます"
@@ -295,6 +347,21 @@
                                 <TextBox x:Name="OllamaContextTextBox" Height="120" TextWrapping="Wrap" AcceptsReturn="True"
                                          VerticalScrollBarVisibility="Auto" Margin="0,0,0,4"/>
                                 <TextBlock Text="話題に関連する記事などを貼り付けておくと、固有名詞の誤翻訳を文脈から補正しやすくなります"
+                                           Style="{StaticResource HelpText}"/>
+                            </StackPanel>
+
+                            <StackPanel Margin="0,12,0,0">
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                    <TextBlock Text="手動用語集(任意)" Style="{StaticResource FieldLabel}" Margin="0,0,4,0"/>
+                                    <TextBlock Text="ⓘ" Foreground="#6688aa" Cursor="Help">
+                                        <TextBlock.ToolTip>
+                                            <ToolTip Content="固有名詞の訳語を確実に固定したい場合、上の参考コンテキストによるAI自動抽出に頼らず、ここに直接指定できます。1行に1エントリ、「原文 => 訳語」の形式で記述してください(例: Aetherium => エーテリウム)。参考コンテキスト側の自動抽出と同じ原文が指定された場合は、こちらの手動指定が優先されます。"/>
+                                        </TextBlock.ToolTip>
+                                    </TextBlock>
+                                </StackPanel>
+                                <TextBox x:Name="ManualGlossaryTextBox" Height="100" TextWrapping="Wrap" AcceptsReturn="True"
+                                         FontFamily="Consolas" VerticalScrollBarVisibility="Auto" Margin="0,0,0,4"/>
+                                <TextBlock Text="1行1エントリ、「原文 => 訳語」の形式(例: Aetherium => エーテリウム)。参考コンテキストの自動抽出より優先されます"
                                            Style="{StaticResource HelpText}"/>
                             </StackPanel>
                         </StackPanel>
@@ -371,6 +438,39 @@
                                Style="{StaticResource HelpText}"/>
 
                     <TextBlock Text="ドラッグでの移動・端をつまんでのリサイズはオーバーレイ表示中いつでも行えます。画面端に近づけると吸着します。"
+                               Style="{StaticResource HelpText}"/>
+                </StackPanel>
+
+                <!-- ==== ゲームプロファイルページ ==== -->
+                <StackPanel x:Name="ProfilesPage" Visibility="Collapsed">
+                    <TextBlock Text="ゲームプロファイル" Style="{StaticResource SectionLabel}"/>
+                    <TextBlock Text="「翻訳エンジン」「言語」「オーバーレイ」タブの設定内容をゲームごとに名前を付けて保存し、切り替えられます(デバイス選択・ホットキー・APIキーなどは対象外で、切り替えても変わりません)。"
+                               Style="{StaticResource HelpText}" Margin="0,0,0,16"/>
+
+                    <TextBlock Text="保存済みプロファイル" Style="{StaticResource FieldLabel}"/>
+                    <ComboBox x:Name="ProfileListComboBox" Margin="0,0,0,8"
+                              SelectionChanged="ProfileListComboBox_SelectionChanged"/>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                        <Button x:Name="ProfileLoadButton" Content="このプロファイルを読み込む" Height="30" Padding="10,0"
+                                Click="ProfileLoadButton_Click"/>
+                        <Button x:Name="ProfileDeleteButton" Content="削除" Height="30" Padding="10,0" Margin="8,0,0,0"
+                                Click="ProfileDeleteButton_Click"/>
+                    </StackPanel>
+                    <TextBlock Text="読み込むと、上記3タブの入力欄の内容がこの画面上で置き換わります。実際に反映されるのは、この設定画面自体を「保存」した時です。"
+                               Style="{StaticResource HelpText}" Margin="0,0,0,16"/>
+
+                    <TextBlock Text="現在の内容を新しいプロファイルとして保存" Style="{StaticResource FieldLabel}"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="ProfileNewNameTextBox" Grid.Column="0"/>
+                        <Button x:Name="ProfileSaveButton" Grid.Column="1" Content="保存" Height="Auto" Padding="14,4"
+                                Margin="8,0,0,0" Click="ProfileSaveButton_Click"/>
+                    </Grid>
+                    <TextBlock Text="この画面で現在入力中の「翻訳エンジン」「言語」「オーバーレイ」タブの内容がそのまま保存されます(この設定画面自体の保存は不要です)。同名のプロファイルが既にある場合は上書きされます。"
                                Style="{StaticResource HelpText}"/>
                 </StackPanel>
 

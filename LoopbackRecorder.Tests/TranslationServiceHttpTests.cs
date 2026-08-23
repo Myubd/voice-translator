@@ -292,4 +292,78 @@ public class TranslationServiceHttpTests
         Assert.Equal("翻訳結果", result.Text);
         Assert.DoesNotContain("Glossary", handler.RequestBodies[2]);
     }
+
+    [Fact]
+    public async Task Ollama_参考コンテキストが空でも手動用語集だけでプロンプトに反映される()
+    {
+        // 参考コンテキストが未入力(自動抽出は行われない)でも、手動用語集はネットワーク不要で
+        // 反映できるため、事前ロードの1リクエストのみで用語集が使えるはず
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""") // 事前ロードのみ
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"エーテリウムを見つけた"}"""); // 翻訳
+        var service = new OllamaTranslationService(
+            new HttpClient(handler), "llama3.1", "http://localhost:11434",
+            context: "", manualGlossary: "Aetherium => エーテリウム");
+
+        await service.PrepareAsync(CancellationToken.None);
+        var result = await service.TranslateAsync("I found Aetherium.", CancellationToken.None);
+
+        Assert.Equal("エーテリウムを見つけた", result.Text);
+        Assert.Contains("Aetherium => エーテリウム", handler.GetPromptFrom(1));
+    }
+
+    [Fact]
+    public async Task Ollama_手動用語集と自動抽出の両方が翻訳プロンプトにマージされる()
+    {
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""") // 事前ロード
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"Malenia => マレニア"}""") // 自動抽出
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"訳文"}"""); // 翻訳
+        var service = new OllamaTranslationService(
+            new HttpClient(handler), "llama3.1", "http://localhost:11434",
+            context: "background text", manualGlossary: "Aetherium => エーテリウム");
+
+        await service.PrepareAsync(CancellationToken.None);
+        await service.TranslateAsync("hello", CancellationToken.None);
+
+        var prompt = handler.GetPromptFrom(2);
+        Assert.Contains("Aetherium => エーテリウム", prompt);
+        Assert.Contains("Malenia => マレニア", prompt);
+    }
+
+    [Fact]
+    public async Task Ollama_自動抽出が失敗しても手動用語集は翻訳プロンプトに残る()
+    {
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""") // 事前ロード
+            .EnqueueJson(HttpStatusCode.InternalServerError, "{}") // 用語集抽出(失敗)
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"訳文"}"""); // 翻訳
+        var service = new OllamaTranslationService(
+            new HttpClient(handler), "llama3.1", "http://localhost:11434",
+            context: "some context", manualGlossary: "Aetherium => エーテリウム");
+
+        await service.PrepareAsync(CancellationToken.None);
+        await service.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Contains("Aetherium => エーテリウム", handler.GetPromptFrom(2));
+    }
+
+    [Fact]
+    public async Task Ollama_同じ原文が両方にある場合は手動用語集が優先される()
+    {
+        var handler = new StubHttpMessageHandler()
+            .EnqueueJson(HttpStatusCode.OK, """{"done":true}""") // 事前ロード
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"Aetherium => 自動抽出訳"}""") // 自動抽出(手動と競合)
+            .EnqueueJson(HttpStatusCode.OK, """{"response":"訳文"}"""); // 翻訳
+        var service = new OllamaTranslationService(
+            new HttpClient(handler), "llama3.1", "http://localhost:11434",
+            context: "background text", manualGlossary: "Aetherium => 手動訳");
+
+        await service.PrepareAsync(CancellationToken.None);
+        await service.TranslateAsync("hello", CancellationToken.None);
+
+        var prompt = handler.GetPromptFrom(2);
+        Assert.Contains("Aetherium => 手動訳", prompt);
+        Assert.DoesNotContain("自動抽出訳", prompt);
+    }
 }

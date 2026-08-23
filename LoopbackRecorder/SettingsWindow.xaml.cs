@@ -47,6 +47,11 @@ public partial class SettingsWindow : Window
     private string _selectedOverlayColor = OverlayColorPresets[0].Hex;
     private readonly List<Border> _overlayColorSwatches = new();
 
+    // ゲームプロファイルページ用。ProfileListComboBoxには名前(string)だけを表示し、
+    // 実データはこちらのリストから名前で引く(GameProfileStore.LoadAllを毎回呼ぶと
+    // 選択変更のたびにファイルI/Oが走ってしまうため、ページ表示時に一度だけ読み込んでおく)。
+    private List<GameProfile> _gameProfiles = new();
+
     // ==== ショートカットキーの記録用状態 ====
     // "startstop" / "overlay" / null(記録中でない)
     private string? _recordingHotkeyTarget;
@@ -116,6 +121,7 @@ public partial class SettingsWindow : Window
         OllamaModelComboBox.Text = Settings.OllamaModel;
         OllamaEndpointTextBox.Text = Settings.OllamaEndpoint;
         DeepLToOllamaFallbackCheckBox.IsChecked = Settings.EnableDeepLToOllamaFallback;
+        TranslationCacheCheckBox.IsChecked = Settings.EnableTranslationCache;
         VadThresholdSlider.Value = Settings.VadThreshold;
         VadHysteresisSlider.Value = Settings.VadHysteresisRatio;
         GameAudioPriorityCheckBox.IsChecked = Settings.GameAudioPriorityMode;
@@ -126,6 +132,7 @@ public partial class SettingsWindow : Window
         InitializeOverlayColorSwatches(Settings.OverlayFontColor);
         WhisperPromptTextBox.Text = Settings.WhisperPrompt;
         OllamaContextTextBox.Text = Settings.OllamaContext;
+        ManualGlossaryTextBox.Text = Settings.ManualGlossary;
 
         // ショートカットキーの現在値を読み込み、表示に反映
         (_startStopModifiers, _startStopKey) = Settings.GetStartStopHotkey();
@@ -162,7 +169,7 @@ public partial class SettingsWindow : Window
     /// <summary>Ollamaにインストール済みのモデル一覧を取得し、ドロップダウンに反映する</summary>
     private async Task LoadOllamaModelsAsync()
     {
-        StatusText.Text = "";
+        SetStatusMessage("");
 
         // Ollamaが応答しない場合に無期限に待たされないよう、タイムアウトを設ける。
         // また設定画面を閉じた場合はこのリクエストごとキャンセルする
@@ -179,13 +186,13 @@ public partial class SettingsWindow : Window
         {
             // ウィンドウを閉じた、またはタイムアウトした場合。閉じた後ならUI更新は不要
             if (!IsLoaded) return;
-            StatusText.Text = "Ollamaへの接続がタイムアウトしました。Ollamaが起動しているか確認してください。";
+            SetStatusMessage("Ollamaへの接続がタイムアウトしました。Ollamaが起動しているか確認してください。");
             return;
         }
         catch (Exception ex)
         {
             Logger.Log("SettingsWindow", "Ollamaモデル一覧の取得に失敗しました。", ex);
-            StatusText.Text = $"Ollamaのモデル一覧を取得できませんでした: {ex.Message}";
+            SetStatusMessage($"Ollamaのモデル一覧を取得できませんでした: {ex.Message}");
             return;
         }
 
@@ -208,7 +215,7 @@ public partial class SettingsWindow : Window
 
         if (models.Count == 0)
         {
-            StatusText.Text = "Ollamaにモデルがインストールされていないようです";
+            SetStatusMessage("Ollamaにモデルがインストールされていないようです");
         }
     }
 
@@ -336,6 +343,138 @@ public partial class SettingsWindow : Window
         }
     }
 
+    // ==== ゲームプロファイル ====
+    // 対象は「翻訳エンジン」「言語」「オーバーレイ」タブの入力内容のみ(デバイス選択・
+    // ホットキー・APIキー等は対象外。GameProfile.csのコメント参照)。
+
+    /// <summary>game_profiles.jsonから一覧を読み込み、ProfileListComboBoxへ反映する。
+    /// 「ゲームプロファイル」ページを開くたび(Nav_Checked経由)に呼ばれるため、他の設定画面
+    /// インスタンスで保存・削除された内容もページを開き直せば反映される。</summary>
+    private void RefreshProfileList()
+    {
+        _gameProfiles = GameProfileStore.LoadAll();
+
+        var previouslySelected = ProfileListComboBox.SelectedItem as string;
+        ProfileListComboBox.ItemsSource = _gameProfiles.Select(p => p.Name).ToList();
+
+        if (previouslySelected != null && _gameProfiles.Any(p => p.Name == previouslySelected))
+        {
+            ProfileListComboBox.SelectedItem = previouslySelected;
+        }
+        else if (_gameProfiles.Count > 0)
+        {
+            ProfileListComboBox.SelectedIndex = 0;
+        }
+
+        UpdateProfileButtonsEnabled();
+    }
+
+    private void UpdateProfileButtonsEnabled()
+    {
+        bool hasSelection = ProfileListComboBox.SelectedItem != null;
+        ProfileLoadButton.IsEnabled = hasSelection;
+        ProfileDeleteButton.IsEnabled = hasSelection;
+    }
+
+    private void ProfileListComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // XAMLロード中、ItemsSource未設定の段階でも発火しうるため、ボタン側のnullは
+        // UpdateProfileButtonsEnabled内では起きない(ProfileLoadButton/ProfileDeleteButtonは
+        // 同じProfilesPage内の兄弟要素であり、このイベント発火時点で必ず生成済みのため)
+        UpdateProfileButtonsEnabled();
+    }
+
+    /// <summary>選択中のプロファイルの値を、この設定画面のUIコントロールへ反映する。
+    /// AppSettings(Settings)自体は書き換えない(この画面自体の「保存」を押すまでは確定させない、
+    /// という他の設定項目と同じ挙動に揃えるため)。</summary>
+    private void ApplyProfileToUiFields(GameProfile profile)
+    {
+        foreach (ComboBoxItem item in BackendComboBox.Items)
+        {
+            if ((string)item.Tag == profile.TranslationBackend)
+            {
+                BackendComboBox.SelectedItem = item;
+                break;
+            }
+        }
+        UpdateBackendPanelsVisibility();
+
+        TargetLanguageComboBox.SelectedItem = LanguageCatalog.FindByDeepLCode(profile.TargetLanguageCode);
+        OllamaContextTextBox.Text = profile.OllamaContext;
+        ManualGlossaryTextBox.Text = profile.ManualGlossary;
+
+        OverlayFontSizeSlider.Value = profile.OverlayFontSize;
+        OverlayOpacitySlider.Value = profile.OverlayOpacity;
+        OverlayMaxLinesSlider.Value = profile.OverlayMaxLines;
+        InitializeOverlayColorSwatches(profile.OverlayFontColor);
+    }
+
+    private void ProfileLoadButton_Click(object sender, RoutedEventArgs e)
+    {
+        var name = ProfileListComboBox.SelectedItem as string;
+        var profile = _gameProfiles.FirstOrDefault(p => p.Name == name);
+        if (profile == null) return;
+
+        ApplyProfileToUiFields(profile);
+        MessageBox.Show(
+            $"プロファイル「{profile.Name}」を読み込みました。実際に反映するには、この設定画面自体を「保存」してください。",
+            "プロファイルを読み込みました", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void ProfileDeleteButton_Click(object sender, RoutedEventArgs e)
+    {
+        var name = ProfileListComboBox.SelectedItem as string;
+        if (name == null) return;
+
+        var confirm = MessageBox.Show(
+            $"プロファイル「{name}」を削除します。この操作は取り消せません。よろしいですか?",
+            "プロファイルの削除", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        GameProfileStore.Delete(name);
+        RefreshProfileList();
+    }
+
+    /// <summary>この設定画面上で「現在入力中」の翻訳エンジン・言語・オーバーレイの内容を
+    /// 新しいプロファイルとして保存する。SaveButton_Click(この設定画面自体の保存)を押していなくても
+    /// 保存できる(プロファイル保存とアプリ全体設定の保存は別の操作として独立させている)。</summary>
+    private void ProfileSaveButton_Click(object sender, RoutedEventArgs e)
+    {
+        var name = ProfileNewNameTextBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            MessageBox.Show("プロファイル名を入力してください。", "プロファイルの保存",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (_gameProfiles.Any(p => p.Name == name))
+        {
+            var confirm = MessageBox.Show(
+                $"同名のプロファイル「{name}」が既にあります。上書きしますか?",
+                "プロファイルの保存", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (confirm != MessageBoxResult.Yes) return;
+        }
+
+        var profile = new GameProfile
+        {
+            Name = name,
+            TranslationBackend = (BackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deepl",
+            TargetLanguageCode = (TargetLanguageComboBox.SelectedItem as LanguageOption)?.DeepLCode ?? "JA",
+            OllamaContext = OllamaContextTextBox.Text,
+            ManualGlossary = ManualGlossaryTextBox.Text,
+            OverlayFontSize = OverlayFontSizeSlider.Value,
+            OverlayOpacity = OverlayOpacitySlider.Value,
+            OverlayMaxLines = (int)OverlayMaxLinesSlider.Value,
+            OverlayFontColor = _selectedOverlayColor,
+        };
+
+        GameProfileStore.Upsert(profile);
+        ProfileNewNameTextBox.Text = "";
+        RefreshProfileList();
+        ProfileListComboBox.SelectedItem = name;
+    }
+
     private void UpdateBackendPanelsVisibility()
     {
         // XAMLロード中(まだ子要素が無い)は何もしない
@@ -357,19 +496,34 @@ public partial class SettingsWindow : Window
         }
     }
 
+    /// <summary>設定画面下部のステータスメッセージ(接続エラー・入力エラー等)を表示/非表示する。
+    /// メッセージが空文字なら、アラートボックス自体を折りたたんで場所を取らないようにする。
+    /// StatusText.Textへの直接代入ではなく必ずこちらを経由すること(表示/非表示の連動漏れを防ぐため)。</summary>
+    private void SetStatusMessage(string message)
+    {
+        StatusText.Text = message;
+        StatusMessageBanner.Visibility = string.IsNullOrEmpty(message) ? Visibility.Collapsed : Visibility.Visible;
+    }
+
     /// <summary>左サイドバーの選択に応じて、右側の表示ページを切り替える</summary>
     private void Nav_Checked(object sender, RoutedEventArgs e)
     {
         // XAMLロード中(まだ各ページの要素が無い)は何もしない
         if (AudioPage == null || EnginePage == null || LanguagePage == null
-            || OverlayPage == null || ShortcutPage == null || AboutPage == null) return;
+            || OverlayPage == null || ProfilesPage == null || ShortcutPage == null || AboutPage == null) return;
 
         AudioPage.Visibility = NavAudio.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         EnginePage.Visibility = NavEngine.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         LanguagePage.Visibility = NavLanguage.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         OverlayPage.Visibility = NavOverlay.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        ProfilesPage.Visibility = NavProfiles.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         ShortcutPage.Visibility = NavShortcuts.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         AboutPage.Visibility = NavAbout.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+
+        if (NavProfiles.IsChecked == true)
+        {
+            RefreshProfileList();
+        }
     }
 
     // ==== ショートカットキーの記録 ====
@@ -404,7 +558,7 @@ public partial class SettingsWindow : Window
     private void BeginRecordingHotkey(string target)
     {
         _recordingHotkeyTarget = target;
-        StatusText.Text = "";
+        SetStatusMessage("");
         var placeholder = "キーを入力してください(Escで取消)...";
         if (target == "startstop") StartStopHotkeyText.Text = placeholder;
         else OverlayHotkeyText.Text = placeholder;
@@ -438,7 +592,7 @@ public partial class SettingsWindow : Window
         var modifiers = Keyboard.Modifiers;
         if (modifiers == ModifierKeys.None)
         {
-            StatusText.Text = "修飾キー(Ctrl・Alt・Shift・Winのいずれか)を1つ以上組み合わせてください。";
+            SetStatusMessage("修飾キー(Ctrl・Alt・Shift・Winのいずれか)を1つ以上組み合わせてください。");
             _recordingHotkeyTarget = null;
             UpdateHotkeyDisplays();
             return;
@@ -468,7 +622,7 @@ public partial class SettingsWindow : Window
         // 常に両方が反応してしまい紛らわしいため、保存前に検証する
         if (_startStopModifiers == _overlayModifiers && _startStopKey == _overlayKey)
         {
-            StatusText.Text = "「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じショートカットキーは設定できません。";
+            SetStatusMessage("「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じショートカットキーは設定できません。");
             UpdateHotkeyDisplays();
             return;
         }
@@ -487,6 +641,7 @@ public partial class SettingsWindow : Window
         Settings.OllamaModel = OllamaModelComboBox.Text;
         Settings.OllamaEndpoint = OllamaEndpointTextBox.Text;
         Settings.EnableDeepLToOllamaFallback = DeepLToOllamaFallbackCheckBox.IsChecked == true;
+        Settings.EnableTranslationCache = TranslationCacheCheckBox.IsChecked == true;
         Settings.VadThreshold = (float)VadThresholdSlider.Value;
         Settings.VadHysteresisRatio = (float)VadHysteresisSlider.Value;
         Settings.GameAudioPriorityMode = GameAudioPriorityCheckBox.IsChecked == true;
@@ -499,6 +654,7 @@ public partial class SettingsWindow : Window
         Settings.RecognitionLanguage = (RecognitionLanguageComboBox.SelectedItem as LanguageOption)?.WhisperCode ?? "auto";
         Settings.TargetLanguageCode = (TargetLanguageComboBox.SelectedItem as LanguageOption)?.DeepLCode ?? "JA";
         Settings.OllamaContext = OllamaContextTextBox.Text;
+        Settings.ManualGlossary = ManualGlossaryTextBox.Text;
         Settings.StartStopHotkeyModifiers = _startStopModifiers.ToString();
         Settings.StartStopHotkeyKey = _startStopKey.ToString();
         Settings.OverlayHotkeyModifiers = _overlayModifiers.ToString();
@@ -539,7 +695,7 @@ public partial class SettingsWindow : Window
         catch (Exception ex)
         {
             Logger.Log("SettingsWindow", "リポジトリリンクを開けませんでした。", ex);
-            StatusText.Text = "リンクを開けませんでした。ブラウザで手動で開いてください。";
+            SetStatusMessage("リンクを開けませんでした。ブラウザで手動で開いてください。");
         }
         e.Handled = true;
     }

@@ -235,20 +235,25 @@ public class OllamaTranslationService : ITranslationService
     private readonly string _endpoint;
     private readonly string _targetLanguageName;
     private readonly string _context;
+    private readonly string _manualGlossary;
 
-    // 参考コンテキストから抽出した「固有名詞→訳語」の短い用語集。
+    // 参考コンテキストから抽出した「固有名詞→訳語」の短い用語集(手動用語集とのマージ後の最終形)。
     // 生の参考コンテキストを毎回プロンプトに含めるより、事前に1回だけ抽出したこちらを
     // 使い回す方が、レイテンシと(文脈からの)ハルシネーションの両方を抑えられる。
     private string? _glossary;
 
+    /// <param name="manualGlossary">ユーザーが設定画面で直接入力した用語集("original => translation"形式、
+    /// 1行1エントリ)。参考コンテキストからのLLM自動抽出とは異なり、ネットワーク呼び出しも
+    /// 抽出の不確実性も無く、確実にその表記で反映したい固有名詞向け。空文字列の場合は無視される。</param>
     public OllamaTranslationService(HttpClient httpClient, string model, string endpoint,
-        string targetLanguageName = "Japanese", string context = "")
+        string targetLanguageName = "Japanese", string context = "", string manualGlossary = "")
     {
         _httpClient = httpClient;
         _model = model;
         _endpoint = endpoint;
         _targetLanguageName = targetLanguageName;
         _context = context;
+        _manualGlossary = manualGlossary;
     }
 
     // 用語集抽出自体のタイムアウト。ユーザーが「停止」した場合は外側のcancellationTokenで
@@ -266,6 +271,13 @@ public class OllamaTranslationService : ITranslationService
     /// 参考コンテキストが設定されている場合、セッション開始時に一度だけ用語集を抽出しておく。
     /// 以降の翻訳では、生の参考コンテキストではなくこの短い用語集を使う。
     ///
+    /// 手動用語集(_manualGlossary)はネットワーク不要でここで確定できるため、まず先に
+    /// これを_glossaryのベースとして確定させる。参考コンテキストからの自動抽出が
+    /// (成功すれば)その上にマージされる。マージ時は手動用語集を先頭に置いた状態で
+    /// BuildValidatedGlossaryへ通すことで、同じ原文が両方にあった場合は手動側が優先される
+    /// (BuildValidatedGlossaryは重複排除で「最初に出現した行」を採用する仕様のため)。
+    /// この順序により、自動抽出が失敗・キャンセルされても手動分だけは確実に反映される。
+    ///
     /// 以前はCancellationTokenを受け取っておらず、Ollamaが応答しない場合にユーザーが「停止」を
     /// 押してもこの処理が完了するまで(=タイムアウトするまで)待たされていた。外側から渡される
     /// cancellationTokenと、抽出自体の上限時間(PrepareTimeout)の両方で打ち切れるようにする。
@@ -279,9 +291,10 @@ public class OllamaTranslationService : ITranslationService
     {
         await PreloadModelAsync(cancellationToken);
 
+        _glossary = BuildValidatedGlossary(_manualGlossary);
+
         if (string.IsNullOrWhiteSpace(_context))
         {
-            _glossary = null;
             return;
         }
 
@@ -309,8 +322,7 @@ public class OllamaTranslationService : ITranslationService
             using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
             if (!response.IsSuccessStatusCode)
             {
-                _glossary = null;
-                return;
+                return; // _glossaryは手動分のみのまま
             }
 
             var json = await response.Content.ReadAsStringAsync(timeoutCts.Token);
@@ -320,25 +332,23 @@ public class OllamaTranslationService : ITranslationService
             // 暴走防止のため、万一異常に長い応答が返ってきた場合は安全のため使わない
             if (string.IsNullOrWhiteSpace(extracted) || extracted.Length >= 3000)
             {
-                _glossary = null;
-                return;
+                return; // _glossaryは手動分のみのまま
             }
 
-            _glossary = BuildValidatedGlossary(extracted);
+            var combinedRaw = string.IsNullOrEmpty(_glossary) ? extracted : $"{_glossary}\n{extracted}";
+            _glossary = BuildValidatedGlossary(combinedRaw);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // ユーザーが「停止」を押した場合。用語集無しで(=呼び出し元へ)そのまま抜ける
-            _glossary = null;
+            // ユーザーが「停止」を押した場合。_glossaryは手動分のみが残った状態でそのまま抜ける
             throw;
         }
         catch (Exception ex)
         {
-            // 抽出に失敗しても翻訳自体は続行できるようにする(コンテキスト無しにフォールバック)。
-            // ただし「なぜ用語集が反映されないのか」が分かるよう原因は記録しておく
+            // 抽出に失敗しても翻訳自体は続行できるようにする(手動用語集のみにフォールバック)。
+            // ただし「なぜ自動抽出分が反映されないのか」が分かるよう原因は記録しておく
             // (タイムアウト単体の場合もここに含まれ、ユーザー操作によるキャンセルとは区別している)
-            Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。用語集無しで続行します。", ex);
-            _glossary = null;
+            Logger.Log("Ollama.Glossary", "参考コンテキストからの用語集抽出に失敗しました。手動用語集のみで続行します。", ex);
         }
     }
 

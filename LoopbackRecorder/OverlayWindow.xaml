@@ -54,7 +54,17 @@
                             <TextBlock Text="{Binding}"
                                        Foreground="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=Foreground}"
                                        FontSize="{Binding RelativeSource={RelativeSource AncestorType=ListBox}, Path=Tag}"
-                                       FontWeight="Bold" TextWrapping="Wrap" TextAlignment="Center" Margin="0,2"/>
+                                       FontWeight="Bold" TextWrapping="Wrap" TextAlignment="Center" Margin="0,2">
+                                <!-- 文字自体への縁取り(黒いハロー)。ゲーム画面はほぼ何色でも背景になり得るため、
+                                     背景Borderの半透明黒だけでは、明るい/白っぽいシーンの上や、オーバーレイの
+                                     不透明度を下げて使っているユーザーでは訳文が視認しづらくなることがある。
+                                     WPFには文字そのものへのストローク描画機能が無いため、DropShadowEffectを
+                                     ShadowDepth=0(真後ろ)・低BlurRadiusで掛けることで、疑似的な縁取りとして
+                                     代用している(BackgroundBorderの縁の光彩と同じ手法)。 -->
+                                <TextBlock.Effect>
+                                    <DropShadowEffect Color="Black" BlurRadius="4" ShadowDepth="0" Opacity="0.9"/>
+                                </TextBlock.Effect>
+                            </TextBlock>
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>

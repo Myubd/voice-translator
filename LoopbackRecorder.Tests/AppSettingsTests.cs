@@ -22,11 +22,11 @@ public class AppSettingsTests : IDisposable
 {
     private static readonly string[] EnvKeys =
     {
-        "DEVICE_KEYWORD", "DEVICE_ID", "TRANSLATION_BACKEND", "ENABLE_DEEPL_TO_OLLAMA_FALLBACK", "OLLAMA_MODEL", "OLLAMA_ENDPOINT",
+        "DEVICE_KEYWORD", "DEVICE_ID", "TRANSLATION_BACKEND", "ENABLE_DEEPL_TO_OLLAMA_FALLBACK", "ENABLE_TRANSLATION_CACHE", "OLLAMA_MODEL", "OLLAMA_ENDPOINT",
         "WHISPER_MODEL_PATH", "WHISPER_THREAD_COUNT", "TRANSLATION_WORKER_COUNT", "MAX_LATENCY_SECONDS", "DEEPL_API_KEY_ENC", "DEEPL_API_KEY",
         "VAD_THRESHOLD", "VAD_HYSTERESIS_RATIO", "GAME_AUDIO_PRIORITY_MODE", "GAME_AUDIO_PRIORITY_MULTIPLIER",
         "OVERLAY_FONT_SIZE", "OVERLAY_OPACITY", "OVERLAY_MAX_LINES", "OVERLAY_FONT_COLOR",
-        "WHISPER_PROMPT", "RECOGNITION_LANGUAGE", "TARGET_LANGUAGE_CODE", "OLLAMA_CONTEXT",
+        "WHISPER_PROMPT", "RECOGNITION_LANGUAGE", "TARGET_LANGUAGE_CODE", "OLLAMA_CONTEXT", "MANUAL_GLOSSARY",
         "START_STOP_HOTKEY_MODIFIERS", "START_STOP_HOTKEY_KEY", "OVERLAY_HOTKEY_MODIFIERS", "OVERLAY_HOTKEY_KEY",
     };
 
@@ -310,7 +310,10 @@ public class AppSettingsTests : IDisposable
     {
         // コードレビュー対応: DeepLはTranslationWorkerCountとは独立にAPI同時実行数を
         // 制限するため、常にConcurrencyLimitedTranslationServiceでラップされる。
-        var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "dummy-key:fx" };
+        // EnableTranslationCache=falseにしているのは、キャッシュ層でさらにラップされて
+        // このテストが検証したい構造(Concurrency層の直下)が1段ずれてしまうのを避けるため
+        // (キャッシュ層のラップ自体は別テストで検証する)。
+        var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "dummy-key:fx", EnableTranslationCache = false };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
@@ -322,7 +325,7 @@ public class AppSettingsTests : IDisposable
     [Fact]
     public void Ollama選択の場合はConcurrencyLimitedTranslationServiceでラップされたOllamaTranslationServiceが返る()
     {
-        var settings = new AppSettings { TranslationBackend = "ollama", DeepLApiKey = "" };
+        var settings = new AppSettings { TranslationBackend = "ollama", DeepLApiKey = "", EnableTranslationCache = false };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
@@ -339,6 +342,7 @@ public class AppSettingsTests : IDisposable
             TranslationBackend = "deepl",
             DeepLApiKey = "dummy-key:fx",
             EnableDeepLToOllamaFallback = false,
+            EnableTranslationCache = false,
         };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
@@ -355,11 +359,38 @@ public class AppSettingsTests : IDisposable
             TranslationBackend = "deepl",
             DeepLApiKey = "dummy-key:fx",
             EnableDeepLToOllamaFallback = true,
+            EnableTranslationCache = false,
         };
 
         var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
 
         Assert.IsType<FallbackTranslationService>(service);
+    }
+
+    [Fact]
+    public void EnableTranslationCacheが既定trueの場合はCachingTranslationServiceでラップされる()
+    {
+        var settings = new AppSettings { TranslationBackend = "deepl", DeepLApiKey = "dummy-key:fx" };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        var cached = Assert.IsType<CachingTranslationService>(service);
+        Assert.IsType<ConcurrencyLimitedTranslationService>(cached.Inner);
+    }
+
+    [Fact]
+    public void EnableTranslationCacheをfalseにするとCachingTranslationServiceでラップされない()
+    {
+        var settings = new AppSettings
+        {
+            TranslationBackend = "deepl",
+            DeepLApiKey = "dummy-key:fx",
+            EnableTranslationCache = false,
+        };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        Assert.IsType<ConcurrencyLimitedTranslationService>(service);
     }
 
     [Fact]
@@ -442,5 +473,38 @@ public class AppSettingsTests : IDisposable
         var reloaded = AppSettings.LoadFromEnv(path);
 
         Assert.Equal("1行目\n2行目", reloaded.OllamaContext);
+    }
+
+    [Fact]
+    public void 改行を含む手動用語集はエスケープされてラウンドトリップする()
+    {
+        var path = CreateTempEnvPath();
+        var original = new AppSettings { ManualGlossary = "Aetherium => エーテリウム\nRadahn => ラダーン" };
+
+        original.SaveToEnv(path);
+        foreach (var key in EnvKeys) Environment.SetEnvironmentVariable(key, null);
+
+        var reloaded = AppSettings.LoadFromEnv(path);
+
+        Assert.Equal("Aetherium => エーテリウム\nRadahn => ラダーン", reloaded.ManualGlossary);
+    }
+
+    [Fact]
+    public void Ollama選択時に手動用語集がOllamaTranslationServiceへそのまま渡される()
+    {
+        var settings = new AppSettings
+        {
+            TranslationBackend = "ollama",
+            ManualGlossary = "Aetherium => エーテリウム",
+            EnableTranslationCache = false,
+        };
+
+        var service = settings.CreateTranslationService(new System.Net.Http.HttpClient());
+
+        var limited = Assert.IsType<ConcurrencyLimitedTranslationService>(service);
+        Assert.IsType<OllamaTranslationService>(limited.Inner);
+        // 実際に用語集がプロンプトへ反映されるかどうかはOllamaTranslationServiceの
+        // PrepareAsync/TranslateAsync自体のHTTP単体テスト(TranslationServiceHttpTests)側で検証する。
+        // ここではAppSettings側が値を渡し忘れていないこと(構築時にエラーなく通ること)のみを確認する。
     }
 }

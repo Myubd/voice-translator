@@ -501,6 +501,15 @@ public partial class MainWindow : Window
 
     private void ClearButton_Click(object sender, RoutedEventArgs e)
     {
+        // 履歴が空の状態でのクリックは実害が無いため、確認なしでそのまま抜ける
+        // (無駄な確認ダイアログを毎回出さないため)。実際に消すものがある場合のみ確認する。
+        if (OriginalListBox.Items.Count == 0) return;
+
+        var confirm = MessageBox.Show(
+            "表示中の翻訳履歴をすべて削除します。この操作は取り消せません。よろしいですか?",
+            "履歴のクリア", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+        if (confirm != MessageBoxResult.Yes) return;
+
         OriginalListBox.Items.Clear();
         TranslatedListBox.Items.Clear();
         _translatedRowIndexById.Clear();

@@ -64,6 +64,11 @@
          AppSettings.CreateTranslationServiceが返すサービスをラップするため、
          AppSettings.csのテストのコンパイルに必要。 -->
     <Compile Include="..\LoopbackRecorder\TranslationConcurrencyLimiter.cs" Link="SourceUnderTest\TranslationConcurrencyLimiter.cs" />
+    <!-- TranslationCache.cs(CachingTranslationService)。同じくAppSettings.CreateTranslationServiceが
+         返すサービスをラップするため、AppSettings.csのテストのコンパイルに必要。 -->
+    <Compile Include="..\LoopbackRecorder\TranslationCache.cs" Link="SourceUnderTest\TranslationCache.cs" />
+    <!-- GameProfile.cs(ゲームプロファイルのモデルとJSON保存/読込)のテスト用。外部通信もWPF依存も無い。 -->
+    <Compile Include="..\LoopbackRecorder\GameProfile.cs" Link="SourceUnderTest\GameProfile.cs" />
     <!-- AppSettings.cs(.envの読み書き・クランプ処理)の単体テスト用。
          AppSettings.Hotkeys.cs(WPF依存のホットキー解析部分)はpartial分割してあり、
          テスト側では意図的にIncludeしない(WPF無しでこのプロジェクトをビルドできるようにするため)。
