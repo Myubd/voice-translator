@@ -59,6 +59,8 @@ public partial class SettingsWindow : Window
     private Key _startStopKey;
     private ModifierKeys _overlayModifiers;
     private Key _overlayKey;
+    private ModifierKeys _ocrModifiers;
+    private Key _ocrKey;
 
     public SettingsWindow(AppSettings currentSettings, HttpClient sharedHttpClient, bool isRunning = false)
     {
@@ -133,10 +135,13 @@ public partial class SettingsWindow : Window
         WhisperPromptTextBox.Text = Settings.WhisperPrompt;
         OllamaContextTextBox.Text = Settings.OllamaContext;
         ManualGlossaryTextBox.Text = Settings.ManualGlossary;
+        OcrSourceLanguageComboBox.ItemsSource = LanguageCatalog.TargetLanguages;
+        OcrSourceLanguageComboBox.SelectedItem = LanguageCatalog.FindByWhisperCode(Settings.OcrSourceLanguageTag);
 
         // ショートカットキーの現在値を読み込み、表示に反映
         (_startStopModifiers, _startStopKey) = Settings.GetStartStopHotkey();
         (_overlayModifiers, _overlayKey) = Settings.GetOverlayHotkey();
+        (_ocrModifiers, _ocrKey) = Settings.GetOcrHotkey();
         UpdateHotkeyDisplays();
         PreviewKeyDown += SettingsWindow_PreviewKeyDown;
 
@@ -543,6 +548,7 @@ public partial class SettingsWindow : Window
     {
         StartStopHotkeyText.Text = FormatHotkey(_startStopModifiers, _startStopKey);
         OverlayHotkeyText.Text = FormatHotkey(_overlayModifiers, _overlayKey);
+        OcrHotkeyText.Text = FormatHotkey(_ocrModifiers, _ocrKey);
     }
 
     private void StartStopHotkeyChangeButton_Click(object sender, RoutedEventArgs e)
@@ -555,13 +561,19 @@ public partial class SettingsWindow : Window
         BeginRecordingHotkey("overlay");
     }
 
+    private void OcrHotkeyChangeButton_Click(object sender, RoutedEventArgs e)
+    {
+        BeginRecordingHotkey("ocr");
+    }
+
     private void BeginRecordingHotkey(string target)
     {
         _recordingHotkeyTarget = target;
         SetStatusMessage("");
         var placeholder = "キーを入力してください(Escで取消)...";
         if (target == "startstop") StartStopHotkeyText.Text = placeholder;
-        else OverlayHotkeyText.Text = placeholder;
+        else if (target == "overlay") OverlayHotkeyText.Text = placeholder;
+        else OcrHotkeyText.Text = placeholder;
     }
 
     /// <summary>ショートカットキー記録中、ウィンドウ全体でキー入力を捕捉する。
@@ -603,10 +615,15 @@ public partial class SettingsWindow : Window
             _startStopModifiers = modifiers;
             _startStopKey = key;
         }
-        else
+        else if (_recordingHotkeyTarget == "overlay")
         {
             _overlayModifiers = modifiers;
             _overlayKey = key;
+        }
+        else
+        {
+            _ocrModifiers = modifiers;
+            _ocrKey = key;
         }
 
         _recordingHotkeyTarget = null;
@@ -618,13 +635,25 @@ public partial class SettingsWindow : Window
         // 記録中に保存を押した場合は一旦キャンセル扱いにする
         _recordingHotkeyTarget = null;
 
-        // 「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じ組み合わせが割り当てられていると
-        // 常に両方が反応してしまい紛らわしいため、保存前に検証する
-        if (_startStopModifiers == _overlayModifiers && _startStopKey == _overlayKey)
+        // 「翻訳開始/停止」「オーバーレイ表示切り替え」「OCR単発翻訳」のいずれか2つに同じ組み合わせが
+        // 割り当てられていると常に両方が反応してしまい紛らわしいため、保存前に全ペアを検証する
+        var assignments = new (string Label, ModifierKeys Modifiers, Key Key)[]
         {
-            SetStatusMessage("「翻訳開始/停止」と「オーバーレイ表示切り替え」に同じショートカットキーは設定できません。");
-            UpdateHotkeyDisplays();
-            return;
+            ("「翻訳開始/停止」", _startStopModifiers, _startStopKey),
+            ("「オーバーレイ表示切り替え」", _overlayModifiers, _overlayKey),
+            ("「OCR単発翻訳」", _ocrModifiers, _ocrKey),
+        };
+        for (int i = 0; i < assignments.Length; i++)
+        {
+            for (int j = i + 1; j < assignments.Length; j++)
+            {
+                if (assignments[i].Modifiers == assignments[j].Modifiers && assignments[i].Key == assignments[j].Key)
+                {
+                    SetStatusMessage($"{assignments[i].Label}と{assignments[j].Label}に同じショートカットキーは設定できません。");
+                    UpdateHotkeyDisplays();
+                    return;
+                }
+            }
         }
 
         if (DeviceComboBox.SelectedItem is AudioDeviceInfo selectedDevice)
@@ -655,10 +684,13 @@ public partial class SettingsWindow : Window
         Settings.TargetLanguageCode = (TargetLanguageComboBox.SelectedItem as LanguageOption)?.DeepLCode ?? "JA";
         Settings.OllamaContext = OllamaContextTextBox.Text;
         Settings.ManualGlossary = ManualGlossaryTextBox.Text;
+        Settings.OcrSourceLanguageTag = (OcrSourceLanguageComboBox.SelectedItem as LanguageOption)?.WhisperCode ?? "en";
         Settings.StartStopHotkeyModifiers = _startStopModifiers.ToString();
         Settings.StartStopHotkeyKey = _startStopKey.ToString();
         Settings.OverlayHotkeyModifiers = _overlayModifiers.ToString();
         Settings.OverlayHotkeyKey = _overlayKey.ToString();
+        Settings.OcrHotkeyModifiers = _ocrModifiers.ToString();
+        Settings.OcrHotkeyKey = _ocrKey.ToString();
 
         Settings.SaveToEnv();
 

@@ -16,6 +16,10 @@ public partial class AppSettings
     public (ModifierKeys Modifiers, Key Key) GetOverlayHotkey() =>
         ParseHotkey(OverlayHotkeyModifiers, OverlayHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.O);
 
+    /// <summary>「OCR単発翻訳」に割り当てられたショートカットキーを取得する。値が不正な場合は既定値(Ctrl+Alt+T)を返す</summary>
+    public (ModifierKeys Modifiers, Key Key) GetOcrHotkey() =>
+        ParseHotkey(OcrHotkeyModifiers, OcrHotkeyKey, ModifierKeys.Control | ModifierKeys.Alt, Key.T);
+
     private static (ModifierKeys, Key) ParseHotkey(string modifiersStr, string keyStr, ModifierKeys defaultModifiers, Key defaultKey)
     {
         var modifiers = Enum.TryParse<ModifierKeys>(modifiersStr, ignoreCase: true, out var parsedModifiers) ? parsedModifiers : defaultModifiers;

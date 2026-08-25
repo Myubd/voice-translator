@@ -11,10 +11,11 @@ using System.Threading;
 /// アプリの設定値をまとめて保持するクラス。
 /// .envから読み込み、SettingsWindowでの変更を.envに書き戻せるようにする。
 ///
-/// partialにしている理由: ホットキー関連の3メソッド(GetStartStopHotkey/GetOverlayHotkey/
-/// ParseHotkey、AppSettings.Hotkeys.csへ分離)だけがSystem.Windows.Input(WPF)に依存しており、
-/// このファイル自体はWPF非依存にしておくことで、LoopbackRecorder.Tests(WPF無しのnet8.0)から
-/// VoiceActivitySegmenter.csと同じ方式(Compile Includeでの直接コンパイル)でテストできるようにする。
+/// partialにしている理由: ホットキー関連の4メソッド(GetStartStopHotkey/GetOverlayHotkey/
+/// GetOcrHotkey/ParseHotkey、AppSettings.Hotkeys.csへ分離)だけがSystem.Windows.Input(WPF)に
+/// 依存しており、このファイル自体はWPF非依存にしておくことで、LoopbackRecorder.Tests(WPF無しの
+/// net8.0)からVoiceActivitySegmenter.csと同じ方式(Compile Includeでの直接コンパイル)で
+/// テストできるようにする。
 /// </summary>
 public partial class AppSettings
 {
@@ -114,6 +115,16 @@ public partial class AppSettings
     public string StartStopHotkeyKey { get; set; } = "R";
     public string OverlayHotkeyModifiers { get; set; } = "Control, Alt";
     public string OverlayHotkeyKey { get; set; } = "O";
+    // OCR単発翻訳(画面の指定範囲を選択してテキスト抽出→翻訳)を起動するショートカット。
+    // 既定はCtrl+Alt+T(Translateの頭文字。既存の開始/停止=R、オーバーレイ=Oと衝突しない字)。
+    public string OcrHotkeyModifiers { get; set; } = "Control, Alt";
+    public string OcrHotkeyKey { get; set; } = "T";
+
+    // ==== OCR単発翻訳 ====
+    // Windows.Media.OcrはBCP-47言語タグを要求する(TargetLanguageCodeのDeepLコードとは体系が異なる
+    // ため共用できない)。既定は英語(海外ニュース記事等、英語の画面キャプチャを想定した値)。
+    // 対象言語のWindows言語パックが未導入の場合、実行時にエラーメッセージで案内する。
+    public string OcrSourceLanguageTag { get; set; } = "en";
 
 
     // exeがどのディレクトリから起動されても同じ.envを見つけられるよう、Whisperモデルパスや
@@ -260,6 +271,9 @@ public partial class AppSettings
         settings.StartStopHotkeyKey = Environment.GetEnvironmentVariable("START_STOP_HOTKEY_KEY") ?? "R";
         settings.OverlayHotkeyModifiers = Environment.GetEnvironmentVariable("OVERLAY_HOTKEY_MODIFIERS") ?? "Control, Alt";
         settings.OverlayHotkeyKey = Environment.GetEnvironmentVariable("OVERLAY_HOTKEY_KEY") ?? "O";
+        settings.OcrHotkeyModifiers = Environment.GetEnvironmentVariable("OCR_HOTKEY_MODIFIERS") ?? "Control, Alt";
+        settings.OcrHotkeyKey = Environment.GetEnvironmentVariable("OCR_HOTKEY_KEY") ?? "T";
+        settings.OcrSourceLanguageTag = Environment.GetEnvironmentVariable("OCR_SOURCE_LANGUAGE_TAG") ?? "en";
 
         return settings;
     }
@@ -486,6 +500,9 @@ public partial class AppSettings
             $"START_STOP_HOTKEY_KEY={StartStopHotkeyKey}",
             $"OVERLAY_HOTKEY_MODIFIERS={OverlayHotkeyModifiers}",
             $"OVERLAY_HOTKEY_KEY={OverlayHotkeyKey}",
+            $"OCR_HOTKEY_MODIFIERS={OcrHotkeyModifiers}",
+            $"OCR_HOTKEY_KEY={OcrHotkeyKey}",
+            $"OCR_SOURCE_LANGUAGE_TAG={OcrSourceLanguageTag}",
         };
 
         // APIキーを含む設定ファイルなので、書き込み途中のクラッシュ/電源断で内容が
@@ -537,6 +554,9 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("START_STOP_HOTKEY_KEY", StartStopHotkeyKey);
         Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_MODIFIERS", OverlayHotkeyModifiers);
         Environment.SetEnvironmentVariable("OVERLAY_HOTKEY_KEY", OverlayHotkeyKey);
+        Environment.SetEnvironmentVariable("OCR_HOTKEY_MODIFIERS", OcrHotkeyModifiers);
+        Environment.SetEnvironmentVariable("OCR_HOTKEY_KEY", OcrHotkeyKey);
+        Environment.SetEnvironmentVariable("OCR_SOURCE_LANGUAGE_TAG", OcrSourceLanguageTag);
     }
 
     // TranslationWorkerCountとは独立に、DeepL/Ollamaそれぞれへの同時リクエスト数を制限する

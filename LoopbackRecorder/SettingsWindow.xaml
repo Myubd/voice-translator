@@ -387,6 +387,12 @@
                         <TextBlock Text="翻訳(原文 → 訳文)" Style="{StaticResource SectionLabel}"/>
                         <TextBlock Text="翻訳先言語(訳文)" Style="{StaticResource FieldLabel}"/>
                         <ComboBox x:Name="TargetLanguageComboBox" DisplayMemberPath="Display" Margin="0,0,0,16"/>
+
+                        <TextBlock Text="OCR単発翻訳(画面キャプチャ → 原文)" Style="{StaticResource SectionLabel}"/>
+                        <TextBlock Text="OCR認識言語" Style="{StaticResource FieldLabel}"/>
+                        <ComboBox x:Name="OcrSourceLanguageComboBox" DisplayMemberPath="Display" Margin="0,0,0,4"/>
+                        <TextBlock Text="画面キャプチャに写っているテキストの言語を選択します。Windows側にその言語の言語パックが入っている必要があります(設定→時刻と言語→言語)。"
+                                   Style="{StaticResource HelpText}"/>
                     </StackPanel>
                 </ScrollViewer>
 
@@ -493,7 +499,7 @@
                     </Grid>
 
                     <TextBlock Text="オーバーレイ表示切り替え" Style="{StaticResource FieldLabel}"/>
-                    <Grid Margin="0,0,0,4">
+                    <Grid Margin="0,0,0,16">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
@@ -502,6 +508,18 @@
                             <TextBlock x:Name="OverlayHotkeyText" Foreground="#4da6ff" FontWeight="Bold" FontSize="14"/>
                         </Border>
                         <Button Grid.Column="1" Content="変更" Width="70" Height="32" Click="OverlayHotkeyChangeButton_Click"/>
+                    </Grid>
+
+                    <TextBlock Text="OCR単発翻訳(範囲選択して翻訳)" Style="{StaticResource FieldLabel}"/>
+                    <Grid Margin="0,0,0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0" Background="#22222f" CornerRadius="6" Padding="10,6" Margin="0,0,8,0">
+                            <TextBlock x:Name="OcrHotkeyText" Foreground="#4da6ff" FontWeight="Bold" FontSize="14"/>
+                        </Border>
+                        <Button Grid.Column="1" Content="変更" Width="70" Height="32" Click="OcrHotkeyChangeButton_Click"/>
                     </Grid>
                     <TextBlock Text="「変更」を押した後、設定したいキーの組み合わせを押してください。Ctrl・Alt・Shift・Winのいずれか1つ以上を含める必要があります。Escキーで取り消せます。"
                                Style="{StaticResource HelpText}"/>
@@ -517,6 +535,43 @@
                         <Hyperlink NavigateUri="https://github.com/Myubd/voice-translator" RequestNavigate="RepositoryLink_RequestNavigate">
                             github.com/Myubd/voice-translator
                         </Hyperlink>
+                    </TextBlock>
+
+                    <TextBlock Text="使い方ガイド" FontSize="15" FontWeight="Bold" Foreground="White" Margin="0,4,0,8"/>
+
+                    <TextBlock Text="① 音声翻訳(VC翻訳)" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="0,0,0,12">
+                        メイン画面の「開始」(既定ショートカット: <Run Text="Ctrl+Alt+R" FontWeight="Bold" Foreground="#4da6ff"/>)で、
+                        選択したデバイスの音声をリアルタイムに認識・翻訳します。ゲーム音声を拾いたい場合は「デバイス」欄で
+                        SteelSeries GG(Sonar)等の仮想オーディオデバイスを選んでください。
+                    </TextBlock>
+
+                    <TextBlock Text="② 訳文オーバーレイ" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="0,0,0,12">
+                        既定ショートカット <Run Text="Ctrl+Alt+O" FontWeight="Bold" Foreground="#4da6ff"/> で、ゲーム画面に重ねて
+                        訳文を表示する半透明ウィンドウの表示/非表示を切り替えます。ドラッグで移動でき、画面端に近づけると
+                        吸着します。文字サイズ・不透明度・表示行数は「オーバーレイ」タブで調整できます。
+                    </TextBlock>
+
+                    <TextBlock Text="③ OCR単発翻訳(NEW)" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="0,0,0,4">
+                        画面上の好きな範囲を選択して、そこに写っているテキスト(ニュース記事・ゲーム内チャット欄・
+                        画像内の文字など)をOCRで読み取り、翻訳した結果をポップアップで表示します。VC翻訳の実行有無に
+                        関わらず、単独でいつでも使えます。起動方法は次の2通りです:
+                    </TextBlock>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="16,0,0,4">
+                        <Run Text="・"/><Run Text="ショートカットキー" FontWeight="Bold" Foreground="White"/><Run Text="(既定: "/>
+                        <Run Text="Ctrl+Alt+T" FontWeight="Bold" Foreground="#4da6ff"/><Run Text=")。「ショートカット」タブで変更できます。"/>
+                    </TextBlock>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="16,0,0,4">
+                        <Run Text="・"/><Run Text="訳文オーバーレイの🔍ボタン" FontWeight="Bold" Foreground="White"/>
+                        <Run Text="(オーバーレイを表示している場合、右上の✕ボタンの隣にあります)。"/>
+                    </TextBlock>
+                    <TextBlock Foreground="#aaaaaa" TextWrapping="Wrap" Margin="0,4,0,12">
+                        起動すると画面が半透明になるので、翻訳したい範囲をドラッグで選択してください(Escで取消)。
+                        認識対象の言語は「言語」タブの「OCR認識言語」欄で指定します。
+                        Windows側にその言語の言語パックが入っていない場合はエラーになるため、その場合はWindowsの
+                        設定(時刻と言語→言語)から言語パックを追加してください。
                     </TextBlock>
                 </StackPanel>
             </Grid>

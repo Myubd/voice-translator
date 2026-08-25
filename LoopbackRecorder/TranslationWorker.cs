@@ -127,6 +127,14 @@ public sealed class TranslationWorker
             if (result.Text != null)
             {
                 TranslatedTextReceived?.Invoke(new TranslatedTextEventArgs(item.Id, result.Text, item.SegmentStartTime, item.SegmentEndTime));
+
+                // 翻訳自体は成功しているが、DeepLの利用上限超過によりOllamaへ代替されている場合。
+                // 訳文は問題なく出るため、ここで警告しないとユーザーはDeepLの上限超過に
+                // 気づかないまま(見た目上は正常に)使い続けてしまう。
+                if (result.Warning != null)
+                {
+                    TranslationErrorOccurred?.Invoke(result.Warning);
+                }
             }
             else if (result.ErrorMessage != null)
             {

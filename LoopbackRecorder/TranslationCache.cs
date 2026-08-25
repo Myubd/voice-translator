@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,6 +24,14 @@ public sealed class CachingTranslationService : ITranslationService
     private readonly ITranslationService _inner;
     private readonly int _maxEntries;
     private readonly ConcurrentDictionary<string, string> _cache = new();
+
+    // 同じ原文に対する翻訳リクエストが複数ワーカーから同時に来た場合、cache miss後の
+    // _inner.TranslateAsync()呼び出しそのものを1回に集約するためのin-flightテーブル。
+    // 「キャッシュに無ければ問い合わせる」だけだと、Worker A/B/Cが同時に同じ原文を
+    // missした場合、全員がDeepL/Ollamaへ個別にリクエストを投げてしまう
+    // (cache stampede)。Lazy<Task<>>で「翻訳中のTaskそのもの」を共有することで、
+    // 2番目以降のワーカーは新規リクエストを発行せず、進行中のTaskをawaitするだけになる。
+    private readonly ConcurrentDictionary<string, Lazy<Task<TranslationResult>>> _inFlight = new();
 
     // ConcurrentDictionaryは挿入順を保持しないため、上限超過時にどれを間引くかを
     // 判断するための挿入順キューを別途持つ。単純なFIFOで十分(LRUほど厳密な
@@ -55,15 +64,38 @@ public sealed class CachingTranslationService : ITranslationService
             return TranslationResult.Success(cached);
         }
 
-        var result = await _inner.TranslateAsync(text, cancellationToken);
+        // 既に他のワーカーが同じ原文を翻訳中であれば、そのTaskに相乗りする。
+        // Lazy<>のおかげで、GetOrAddが複数スレッドから同時に呼ばれても
+        // ファクトリ(_inner.TranslateAsync呼び出し)自体は1回しか実行されない。
+        var lazyTask = _inFlight.GetOrAdd(
+            text,
+            _ => new Lazy<Task<TranslationResult>>(
+                () => _inner.TranslateAsync(text, cancellationToken),
+                LazyThreadSafetyMode.ExecutionAndPublication));
 
-        if (result.Text != null)
+        try
         {
-            Store(text, result.Text);
-            Logger.LogMetric("TranslationCache", ("event", "miss"));
-        }
+            var result = await lazyTask.Value;
 
-        return result;
+            if (result.Text != null)
+            {
+                Store(text, result.Text);
+            }
+            // 複数ワーカーが同じin-flight Taskに相乗りした場合、ここは全員通過するため
+            // "miss"の記録回数は実際のAPI呼び出し回数より多くなり得る(=キャッシュされて
+            // いなかったリクエストの件数、という意味のmetricとして扱う。実際の重複排除が
+            // 効いているかどうかは呼び出し先(DeepL/Ollamaサービス)側の呼び出し回数で確認する)。
+            Logger.LogMetric("TranslationCache", ("event", "miss"));
+
+            return result;
+        }
+        finally
+        {
+            // 完了したエントリはin-flightテーブルから外す。他ワーカーが待っている間に
+            // 除去してしまうとawait中のlazyTaskの参照自体は生きているため問題ない
+            // (TryRemoveは「これから新規に来るリクエスト」向けの掃除)。
+            _inFlight.TryRemove(text, out _);
+        }
     }
 
     private void Store(string text, string translated)

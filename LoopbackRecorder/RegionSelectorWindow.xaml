@@ -1,0 +1,30 @@
+<Window x:Class="LoopbackRecorder.RegionSelectorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="翻訳する範囲を選択"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="#40000000"
+        Topmost="True"
+        ShowInTaskbar="False"
+        Cursor="Cross"
+        WindowStartupLocation="Manual"
+        KeyDown="Window_KeyDown"
+        MouseLeftButtonDown="Window_MouseLeftButtonDown"
+        MouseMove="Window_MouseMove"
+        MouseLeftButtonUp="Window_MouseLeftButtonUp">
+    <Canvas x:Name="RootCanvas">
+        <Rectangle x:Name="SelectionRectangle"
+                   Stroke="#29C7C1" StrokeThickness="2"
+                   Fill="#3329C7C1"
+                   Visibility="Collapsed"/>
+        <TextBlock x:Name="HintText"
+                   Text="ドラッグして翻訳したい範囲を選択(Escでキャンセル)"
+                   Foreground="White" FontSize="16" FontWeight="Bold"
+                   Canvas.Left="20" Canvas.Top="20">
+            <TextBlock.Effect>
+                <DropShadowEffect Color="Black" BlurRadius="6" ShadowDepth="0" Opacity="0.9"/>
+            </TextBlock.Effect>
+        </TextBlock>
+    </Canvas>
+</Window>

@@ -384,7 +384,13 @@ public class AudioPipeline : IDisposable
             };
 
             // デバイスが他プロセス(Sonar等)と一時的に競合してエラーになることがあるため、
-            // 数回リトライしてから諦める(Sonarを手動再起動しなくても自然に復帰することが多い)
+            // 数回リトライしてから諦める(Sonarを手動再起動しなくても自然に復帰することが多い)。
+            //
+            // 以前はCOMException全般をリトライ対象にしていたが、これは「デバイスが他アプリで
+            // 使用中」以外の致命的なエラー(フォーマット非対応、デバイス自体が存在しない等)まで
+            // 無条件に5回×1秒待ってから失敗させてしまい、原因の分からないまま無駄に待たされる
+            // ユーザー体験になっていた。HResultで実際に一時的な競合を示すエラーコードのみ
+            // リトライし、それ以外は即座に失敗させて原因を伝える。
             const int maxRetries = 5;
             bool captureStarted = false;
             for (int attempt = 1; attempt <= maxRetries; attempt++)
@@ -395,10 +401,19 @@ public class AudioPipeline : IDisposable
                     captureStarted = true;
                     break;
                 }
-                catch (System.Runtime.InteropServices.COMException) when (attempt < maxRetries)
+                catch (System.Runtime.InteropServices.COMException ex)
+                    when (attempt < maxRetries && IsTransientDeviceError(ex.HResult))
                 {
                     StatusChanged?.Invoke($"デバイスが使用中のためリトライ中... ({attempt}/{maxRetries})");
                     await Task.Delay(1000, cancellationToken);
+                }
+                catch (System.Runtime.InteropServices.COMException ex)
+                {
+                    // リトライ対象外のエラー、またはリトライ上限に達した場合はここに来る。
+                    // captureStarted=falseのまま抜け、下のガードでユーザーに明示的なメッセージを出す。
+                    Logger.Log("AudioPipeline.Capture",
+                        $"音声キャプチャの開始に失敗しました(HResult: 0x{ex.HResult:X8})。", ex);
+                    break;
                 }
             }
 
@@ -857,6 +872,23 @@ public class AudioPipeline : IDisposable
         _sileroDetector?.Dispose();
         _sileroDetector = null;
     }
+
+    // WASAPI(Windows Audio Session API)がCOMExceptionのHResultとして返す、
+    // 「デバイスが一時的に使えない」系のエラーコード。これらのみリトライ対象とする。
+    // 参照: https://learn.microsoft.com/windows/win32/coreaudio/audclnt-e-device-in-use
+    private const int AUDCLNT_E_DEVICE_IN_USE = unchecked((int)0x88890019);
+    private const int AUDCLNT_E_DEVICE_INVALIDATED = unchecked((int)0x88890004);
+    private const int AUDCLNT_E_ENDPOINT_CREATE_FAILED = unchecked((int)0x88890014);
+
+    /// <summary>他プロセスによる一時的な占有や、デバイス列挙のタイミング競合など、
+    /// 「少し待てば自然に回復し得る」種類のエラーかどうかを判定する。
+    /// フォーマット非対応(AUDCLNT_E_UNSUPPORTED_FORMAT)やデバイス自体が存在しない場合の
+    /// エラーはここに含めない(何度待っても状況が変わらないため、即座に失敗させて
+    /// ユーザーに気づかせた方が良い)。</summary>
+    private static bool IsTransientDeviceError(int hResult) => hResult is
+        AUDCLNT_E_DEVICE_IN_USE or
+        AUDCLNT_E_DEVICE_INVALIDATED or
+        AUDCLNT_E_ENDPOINT_CREATE_FAILED;
 }
 
 /// <summary>デバイス選択用の情報。OS上で一意なIDと表示名の両方を保持する。

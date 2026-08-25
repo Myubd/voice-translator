@@ -13,6 +13,11 @@ public partial class OverlayWindow : Window
     // TranslatedListBox(WPFのUI要素)へ反映する役割に専念する。
     private readonly OverlayLineOrderer _orderer = new(maxLines: 4);
 
+    /// <summary>オーバーレイの「🔍」ボタンが押された時に発火する。実際のOCR範囲選択〜翻訳の処理は
+    /// MainWindow側(StartOcrCapture)が持っているため、このクラスは通知に専念する
+    /// (ホットキーからの起動と処理を一本化し、二重実装を避けるため)。</summary>
+    public event Action? OcrRequested;
+
     public OverlayWindow()
     {
         InitializeComponent();
@@ -186,5 +191,10 @@ public partial class OverlayWindow : Window
     private void CloseButton_Click(object sender, RoutedEventArgs e)
     {
         Hide();
+    }
+
+    private void OcrButton_Click(object sender, RoutedEventArgs e)
+    {
+        OcrRequested?.Invoke();
     }
 }

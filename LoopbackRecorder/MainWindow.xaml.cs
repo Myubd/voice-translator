@@ -43,6 +43,13 @@ public partial class MainWindow : Window
     // RunAsync側の非同期な後片付けが完了する前にプロセスが終了してしまう可能性があった)。
     private Task? _pipelineTask;
 
+    // OCR単発翻訳用。WindowsOcrServiceはOcrEngineの生成コストがあるため使い回す。
+    // _ocrCts: 連続でホットキーを押した場合、前回のOCR/翻訳処理をキャンセルしてから新しい範囲選択を
+    // 始める(古い結果が後から出てきて新しい選択結果を上書きする、というレースを避けるため)。
+    private readonly WindowsOcrService _ocrService = new();
+    private CancellationTokenSource? _ocrCts;
+    private RegionSelectorWindow? _activeOcrSelector;
+
     /// <summary>Id → TranslatedListBox上の行インデックス。原文が届いた時点で「翻訳中…」の
     /// プレースホルダーをこのインデックスに追加しておき、翻訳結果(成功/失敗)が届いたら
     /// 同じ位置を書き換える。これにより翻訳の成否によらず原文/訳文の行が常に揃う。</summary>
@@ -294,6 +301,8 @@ public partial class MainWindow : Window
         _hotkeyManager?.Dispose();
         _cts?.Cancel();
         _cts?.Dispose();
+        _ocrCts?.Cancel();
+        _ocrCts?.Dispose();
         _overlayWindow?.Close();
         _httpClient.Dispose();
         // Silero VADのONNXセッション(ネイティブリソース)を解放する。
@@ -340,14 +349,115 @@ public partial class MainWindow : Window
             overlayFailed = true;
         }
 
+        bool ocrFailed = false;
+        try
+        {
+            var (modifiers, key) = _settings.GetOcrHotkey();
+            _hotkeyManager.Register(modifiers, key, StartOcrCapture);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("MainWindow.Hotkey", "「OCR単発翻訳」のショートカットキー登録に失敗しました。", ex);
+            ocrFailed = true;
+        }
+
         // 他アプリと同じ組み合わせが既に登録済み等で失敗しても、通常のボタン操作は引き続き使えるため
         // アプリ自体は継続するが、原因不明のまま「ホットキーが効かない」状態にならないよう通知する
-        if (startStopFailed || overlayFailed)
+        if (startStopFailed || overlayFailed || ocrFailed)
         {
-            string which = startStopFailed && overlayFailed
-                ? "「翻訳開始/停止」「オーバーレイ表示切り替え」両方のショートカットキー"
-                : startStopFailed ? "「翻訳開始/停止」のショートカットキー" : "「オーバーレイ表示切り替え」のショートカットキー";
-            StatusText.Text = $"{which}の登録に失敗しました(他アプリと重複している可能性があります)。設定画面で変更できます。";
+            var failedNames = new List<string>();
+            if (startStopFailed) failedNames.Add("「翻訳開始/停止」");
+            if (overlayFailed) failedNames.Add("「オーバーレイ表示切り替え」");
+            if (ocrFailed) failedNames.Add("「OCR単発翻訳」");
+
+            StatusText.Text = $"{string.Join("・", failedNames)}のショートカットキーの登録に失敗しました" +
+                               "(他アプリと重複している可能性があります)。設定画面で変更できます。";
+        }
+    }
+
+    /// <summary>OCR単発翻訳のホットキーが押された時のエントリポイント。
+    /// 1. 画面全体を覆う半透明ウィンドウを出し、ユーザーに矩形をドラッグ選択させる
+    /// 2. 選択範囲をスクリーンショット
+    /// 3. Windows OCRでテキスト抽出
+    /// 4. 既存のVC翻訳と同じITranslationService(DeepL/Ollama、キャッシュ・フォールバック込み)で翻訳
+    /// 5. 結果を非モーダルなポップアップに表示
+    ///
+    /// VC翻訳(_pipeline側)とは完全に独立した経路なので、翻訳が実行中でなくても、
+    /// ゲーム音声を拾っていなくても単独で使える。
+    /// </summary>
+    private void StartOcrCapture()
+    {
+        // 前回のOCR/翻訳がまだ進行中なら打ち切る(結果が前後してポップアップを取り違えないように)。
+        _ocrCts?.Cancel();
+        _ocrCts?.Dispose();
+        _ocrCts = new CancellationTokenSource();
+        var cancellationToken = _ocrCts.Token;
+
+        // 範囲選択中にもう一度ホットキーを押した場合、選択オーバーレイが重複して残らないようにする。
+        _activeOcrSelector?.Close();
+
+        var selector = new RegionSelectorWindow();
+        _activeOcrSelector = selector;
+        selector.RegionSelected += region => _ = RunOcrTranslationAsync(region, cancellationToken);
+        selector.Closed += (_, _) =>
+        {
+            if (_activeOcrSelector == selector) _activeOcrSelector = null;
+        };
+        selector.Show();
+    }
+
+    private async Task RunOcrTranslationAsync(System.Drawing.Rectangle region, CancellationToken cancellationToken)
+    {
+        var resultWindow = new OcrResultWindow
+        {
+            // 選択範囲の近くに出したいところだが、選択範囲は物理ピクセル・このWindowの座標系は
+            // DIPで、かつ表示先モニタのDPIが確定する前に正確な変換をするのは複雑になるため、
+            // プロトタイプでは単純にプライマリスクリーン中央に表示する。
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+        };
+        resultWindow.Show();
+
+        try
+        {
+            var pngBytes = ScreenCaptureService.CaptureRegion(region);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var recognizedText = await _ocrService.RecognizeTextAsync(pngBytes, _settings.OcrSourceLanguageTag, cancellationToken);
+            if (string.IsNullOrWhiteSpace(recognizedText))
+            {
+                resultWindow.SetError("選択した範囲からテキストを認識できませんでした。範囲を変えて再度お試しください。");
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var translationService = _settings.CreateTranslationService(_httpClient);
+            var result = await translationService.TranslateAsync(recognizedText, cancellationToken);
+
+            if (result.Text != null)
+            {
+                resultWindow.SetResult(recognizedText, result.Text);
+            }
+            else
+            {
+                resultWindow.SetResult(recognizedText, result.ErrorMessage ?? "翻訳に失敗しました。");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 連続でホットキーを押した場合など、意図的なキャンセル。ウィンドウは
+            // RunOcrTranslationAsync呼び出し元(次のStartOcrCapture)側の新しい結果表示に
+            // 任せるため、ここでは静かに閉じるだけでよい。
+            resultWindow.Close();
+        }
+        catch (OcrUnavailableException ex)
+        {
+            resultWindow.SetError(ex.Message);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("MainWindow.Ocr", "OCR単発翻訳中にエラーが発生しました。", ex);
+            resultWindow.SetError($"エラーが発生しました: {ex.Message}");
         }
     }
 
@@ -526,7 +636,14 @@ public partial class MainWindow : Window
     {
         if (_overlayWindow == null || !_overlayWindow.IsVisible)
         {
-            _overlayWindow ??= new OverlayWindow();
+            if (_overlayWindow == null)
+            {
+                _overlayWindow = new OverlayWindow();
+                // ゲーム中はMainWindowを操作しづらいため、オーバーレイの🔍ボタンからも
+                // OCR単発翻訳を起動できるようにする(ホットキーと同じStartOcrCaptureを呼ぶことで、
+                // 起動経路が2つあっても実処理は一本化されたまま)。
+                _overlayWindow.OcrRequested += StartOcrCapture;
+            }
             _overlayWindow.ApplyAppearance(_settings.OverlayFontSize, _settings.OverlayOpacity, _settings.OverlayMaxLines, _settings.OverlayFontColor);
             _overlayWindow.Show();
         }

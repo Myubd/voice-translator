@@ -34,4 +34,10 @@ public static class LanguageCatalog
 
     public static LanguageOption FindByDeepLCode(string deepLCode) =>
         TargetLanguages.FirstOrDefault(l => l.DeepLCode == deepLCode) ?? DefaultTargetLanguage;
+
+    /// <summary>WhisperCode(BCP-47に近い簡易コード。en/ja/ko等)から言語を探す。
+    /// OCR認識言語の選択(Windows.Media.Ocrへ渡すBCP-47タグ)に使う。
+    /// 認識対象に「自動」は無いため、SourceLanguages(autoを含む)ではなくTargetLanguagesから探す。</summary>
+    public static LanguageOption FindByWhisperCode(string whisperCode) =>
+        TargetLanguages.FirstOrDefault(l => l.WhisperCode == whisperCode) ?? DefaultTargetLanguage;
 }

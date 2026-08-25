@@ -2,11 +2,25 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- OCR単発翻訳プロトタイプでWindows.Media.Ocr(WinRT API)を直接使うため、
+         net8.0-windowsからWindows SDKバージョン付きのTFMに変更。
+         .NET 5以降はこの形式のTFMであればCsWinRTのプロジェクションが自動生成され、
+         追加のNuGetパッケージ無しでWinRT APIをC#から直接呼び出せる。
+         TargetPlatformMinVersionはWindows.Media.Ocr(OcrEngine)が利用可能な
+         Windows 10 1809(10.0.17763.0)以降に設定(これ未満のWindowsでは
+         OCR機能だけ実行時に使えないが、アプリ自体は起動できる想定)。 -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- OCRのための矩形範囲スクリーンショット取得(System.Drawing.Common)。
+         net8.0-windows系TFMではWindows専用APIとして問題なく使える。 -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.8" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />

@@ -22,12 +22,22 @@
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
 
-                <!-- 上部のつまみ部分(ドラッグ移動・閉じるボタン用)。ゲーム上での誤操作を避けるため最小限に -->
+                <!-- 上部のつまみ部分(ドラッグ移動・OCR翻訳起動・閉じるボタン用)。ゲーム上での誤操作を避けるため最小限に -->
                 <Grid Grid.Row="0" Margin="0,0,0,4">
                     <TextBlock Text="⠿⠿⠿" Foreground="#66FFFFFF" FontSize="10" HorizontalAlignment="Left"/>
-                    <Button x:Name="CloseButton" Content="✕" Width="20" Height="20" Padding="0"
-                            HorizontalAlignment="Right" Background="Transparent" Foreground="#AAFFFFFF"
-                            BorderThickness="0" Click="CloseButton_Click"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <!-- ゲーム中はMainWindowを操作しづらいため、Ctrl+Alt+Tホットキーに加えて
+                             このオーバーレイからもOCR単発翻訳(画面の範囲選択→翻訳)を起動できるようにする。
+                             実際の処理(範囲選択オーバーレイの表示以降)はMainWindow側が持っているため、
+                             ここではOcrRequestedイベントを発火するだけに留める。 -->
+                        <Button x:Name="OcrButton" Content="🔍" Width="20" Height="20" Padding="0"
+                                ToolTip="範囲を選択してOCR翻訳(Ctrl+Alt+T)"
+                                Background="Transparent" Foreground="#AAFFFFFF"
+                                BorderThickness="0" Click="OcrButton_Click" Margin="0,0,4,0"/>
+                        <Button x:Name="CloseButton" Content="✕" Width="20" Height="20" Padding="0"
+                                Background="Transparent" Foreground="#AAFFFFFF"
+                                BorderThickness="0" Click="CloseButton_Click"/>
+                    </StackPanel>
                 </Grid>
 
                 <!-- 訳文本体(複数行を履歴として積み上げ、最新行が見えるよう自動スクロールする) -->
