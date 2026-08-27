@@ -115,6 +115,8 @@ public class TranslationServiceHttpTests
 
         Assert.Null(result.Text);
         Assert.Contains("APIキー", result.ErrorMessage);
+        Assert.True(result.IsAuthError);
+        Assert.False(result.IsQuotaError);
     }
 
     [Fact]
@@ -126,6 +128,8 @@ public class TranslationServiceHttpTests
         var result = await service.TranslateAsync("x", CancellationToken.None);
 
         Assert.Contains("利用上限", result.ErrorMessage);
+        Assert.True(result.IsQuotaError);
+        Assert.False(result.IsAuthError);
     }
 
     [Fact]

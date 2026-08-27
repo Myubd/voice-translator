@@ -83,6 +83,14 @@ public partial class AppSettings
     /// 以前は1.5固定でUIから調整できなかったため、設定画面から変更できるようにした。</summary>
     public float GameAudioPriorityMultiplier { get; set; } = 1.5f;
 
+    /// <summary>ゲーム関連機能(ゲーム音声優先モード・ゲームプロファイル)を設定画面に表示するかどうか。
+    /// このアプリはゲーム専用ではなく日常的な翻訳(OCR単発翻訳等)にも使うことを想定しているため、
+    /// ゲーム用途で使わない人にとって不要な設定項目を隠せるようにする。OFFにしてもゲーム音声優先
+    /// モード自体や既存のゲームプロファイルのデータが消えるわけではなく、単に設定画面から
+    /// 隠れるだけ(GameAudioPriorityMode自体の値は保持される。VC翻訳・OCR翻訳は
+    /// このフラグに関わらず常に使える)。</summary>
+    public bool GameModeEnabled { get; set; } = false;
+
     public double OverlayFontSize { get; set; } = 22;
     public double OverlayOpacity { get; set; } = 0.7;
     public int OverlayMaxLines { get; set; } = 4;
@@ -222,6 +230,11 @@ public partial class AppSettings
         if (bool.TryParse(Environment.GetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE"), out var priorityMode))
         {
             settings.GameAudioPriorityMode = priorityMode;
+        }
+
+        if (bool.TryParse(Environment.GetEnvironmentVariable("GAME_MODE_ENABLED"), out var gameModeEnabled))
+        {
+            settings.GameModeEnabled = gameModeEnabled;
         }
 
         if (bool.TryParse(Environment.GetEnvironmentVariable("ENABLE_DEEPL_TO_OLLAMA_FALLBACK"), out var fallbackEnabled))
@@ -430,6 +443,7 @@ public partial class AppSettings
             "",
             "# ゲーム音声優先モード(小さい雑音より大きい音声を優先的に拾う)",
             $"GAME_AUDIO_PRIORITY_MODE={GameAudioPriorityMode}",
+            $"GAME_MODE_ENABLED={GameModeEnabled}",
             "",
             "# ゲーム音声優先モードON時にVAD閾値へ掛ける倍率(大きいほど小さい音を拾わなくなる)",
             $"GAME_AUDIO_PRIORITY_MULTIPLIER={GameAudioPriorityMultiplier.ToString(CultureInfo.InvariantCulture)}",
@@ -521,6 +535,7 @@ public partial class AppSettings
         Environment.SetEnvironmentVariable("VAD_THRESHOLD", VadThreshold.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("VAD_HYSTERESIS_RATIO", VadHysteresisRatio.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MODE", GameAudioPriorityMode.ToString());
+        Environment.SetEnvironmentVariable("GAME_MODE_ENABLED", GameModeEnabled.ToString());
         Environment.SetEnvironmentVariable("ENABLE_DEEPL_TO_OLLAMA_FALLBACK", EnableDeepLToOllamaFallback.ToString());
         Environment.SetEnvironmentVariable("GAME_AUDIO_PRIORITY_MULTIPLIER", GameAudioPriorityMultiplier.ToString(CultureInfo.InvariantCulture));
         Environment.SetEnvironmentVariable("OVERLAY_FONT_SIZE", OverlayFontSize.ToString(CultureInfo.InvariantCulture));

@@ -512,9 +512,11 @@ public partial class MainWindow : Window
             : Path.Combine(AppContext.BaseDirectory, _settings.WhisperModelPath);
         if (!File.Exists(resolvedModelPath))
         {
-            MessageBox.Show(
-                $"Whisperモデルファイルが見つかりません:\n{resolvedModelPath}\n\n設定画面でモデルファイルを配置するか、正しいファイル名を指定してください。",
-                "モデルが見つかりません", MessageBoxButton.OK, MessageBoxImage.Warning);
+            // ゲーム中にホットキーで押した場合、MessageBoxはゲームウィンドウの背後に隠れて
+            // 気づけない・フォーカスを奪ってゲームを一時中断させてしまうことがあるため、
+            // 既存のStatusText(ホットキー登録失敗時の通知等と同じ経路)で表示する。
+            StatusText.Text = $"Whisperモデルファイルが見つかりません: {resolvedModelPath}" +
+                               "(設定画面でモデルファイルを配置するか、正しいファイル名を指定してください)";
             return;
         }
 
@@ -557,6 +559,7 @@ public partial class MainWindow : Window
         SetRunningUiState(true);
         StatusText.Text = "起動中...";
 
+        string? pipelineErrorMessage = null;
         try
         {
             _pipelineTask = _pipeline.RunAsync(_settings.DeviceId, _settings.DeviceKeyword, _settings.WhisperModelPath, _settings.WhisperPrompt, _settings.RecognitionLanguage, _settings.WhisperThreadCount, _settings.TranslationWorkerCount, _settings.MaxLatencySeconds, _cts.Token);
@@ -569,16 +572,24 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Log("MainWindow", "音声パイプラインの実行中に予期しない例外が発生しました。", ex);
-            MessageBox.Show($"エラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            // ゲーム中にこの例外が起きた場合、MessageBoxはゲームウィンドウの背後に隠れて
+            // 気づけないままフォーカスだけ奪われることがあるため、StatusTextで通知する
+            // (下のfinally節でSetRunningUiState(false, ...)に渡し、"停止中"の代わりに表示する。
+            // finally節がStatusTextを"停止中"で上書きしてしまわないよう、ここでは直接
+            // StatusTextへ代入しない)。
+            pipelineErrorMessage = $"エラーが発生し、翻訳が停止しました: {ex.Message}";
         }
         finally
         {
             _pipelineTask = null;
-            SetRunningUiState(false);
+            SetRunningUiState(false, pipelineErrorMessage);
         }
     }
 
-    private void SetRunningUiState(bool running)
+    /// <summary>実行中/停止中の見た目(ボタンラベル・アイコン・ステータスドット)を切り替える。
+    /// statusOverrideを指定した場合、停止時の既定表示("停止中")の代わりにそれを表示する
+    /// (例外で停止した場合にエラー内容を伝えるため。指定が無ければ従来通り"停止中")。</summary>
+    private void SetRunningUiState(bool running, string? statusOverride = null)
     {
         _isRunning = running;
         StartStopLabel.Text = running ? "翻訳停止" : "翻訳開始";
@@ -588,7 +599,7 @@ public partial class MainWindow : Window
             : new SolidColorBrush(Color.FromRgb(0x66, 0x66, 0x77));
         if (!running)
         {
-            StatusText.Text = "停止中";
+            StatusText.Text = statusOverride ?? "停止中";
         }
     }
 
@@ -660,7 +671,7 @@ public partial class MainWindow : Window
     {
         if (TranslatedListBox.Items.Count == 0 && OriginalListBox.Items.Count == 0)
         {
-            MessageBox.Show("エクスポートする履歴がありません。", "エクスポート", MessageBoxButton.OK, MessageBoxImage.Information);
+            StatusText.Text = "エクスポートする履歴がありません。";
             return;
         }
 
@@ -686,7 +697,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Log("MainWindow.Export", "履歴のエクスポートに失敗しました。", ex);
-            MessageBox.Show($"エクスポートに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusText.Text = $"エクスポートに失敗しました: {ex.Message}";
         }
     }
 

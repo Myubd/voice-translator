@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace LoopbackRecorder.Tests;
@@ -26,6 +27,8 @@ public class GameProfileTests : IDisposable
         foreach (var path in _tempFiles)
         {
             if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+            if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp");
         }
     }
 
@@ -163,5 +166,69 @@ public class GameProfileTests : IDisposable
         var profiles = GameProfileStore.LoadAll(path);
 
         Assert.Empty(profiles);
+    }
+
+    [Fact]
+    public void SaveAllは前回の内容を_bakとして残す()
+    {
+        var path = CreateTempProfilesPath();
+        GameProfileStore.SaveAll(new List<GameProfile> { new() { Name = "旧世代" } }, path);
+        GameProfileStore.SaveAll(new List<GameProfile> { new() { Name = "新世代" } }, path);
+
+        Assert.True(File.Exists(path + ".bak"));
+        var backedUp = GameProfileStore.LoadAll(path + ".bak");
+        Assert.Equal("旧世代", Assert.Single(backedUp).Name);
+
+        // 本体は最新の内容のまま
+        var current = GameProfileStore.LoadAll(path);
+        Assert.Equal("新世代", Assert.Single(current).Name);
+    }
+
+    [Fact]
+    public void 本体が壊れていてもバックアップから自動復旧する()
+    {
+        var path = CreateTempProfilesPath();
+        GameProfileStore.SaveAll(new List<GameProfile> { new() { Name = "正常な世代" } }, path);
+        // 2回目の保存で.bakに「正常な世代」が退避された状態にしてから、本体だけ壊す
+        GameProfileStore.SaveAll(new List<GameProfile> { new() { Name = "正常な世代" } }, path);
+        File.WriteAllText(path, "{ これは壊れたJSON");
+
+        var recovered = GameProfileStore.LoadAll(path, out var recoveredFromBackup);
+
+        Assert.True(recoveredFromBackup);
+        Assert.Equal("正常な世代", Assert.Single(recovered).Name);
+    }
+
+    [Fact]
+    public void 本体もバックアップも壊れている場合は空リストを返す()
+    {
+        var path = CreateTempProfilesPath();
+        File.WriteAllText(path, "{ 壊れた本体");
+        File.WriteAllText(path + ".bak", "{ 壊れたバックアップ");
+
+        var profiles = GameProfileStore.LoadAll(path, out var recoveredFromBackup);
+
+        Assert.Empty(profiles);
+        Assert.False(recoveredFromBackup);
+    }
+
+    /// <summary>
+    /// GameProfileStore.Upsertはlock(FileLock)なので、複数スレッドから同時にUpsertされても
+    /// 「LoadAll→編集→SaveAll」の間に割り込まれてlost updateにならないことを検証する
+    /// (以前はロックが無く、後勝ちで一方の追加が消える可能性があった)。
+    /// </summary>
+    [Fact]
+    public async Task 複数スレッドから同時にUpsertしても全件保存される()
+    {
+        var path = CreateTempProfilesPath();
+        const int profileCount = 20;
+
+        var tasks = Enumerable.Range(0, profileCount)
+            .Select(i => Task.Run(() => GameProfileStore.Upsert(new GameProfile { Name = $"Game{i:D2}" }, path)))
+            .ToArray();
+        await Task.WhenAll(tasks);
+
+        var reloaded = GameProfileStore.LoadAll(path);
+        Assert.Equal(profileCount, reloaded.Count);
     }
 }

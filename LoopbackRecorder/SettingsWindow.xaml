@@ -145,6 +145,14 @@
         <!-- 左サイドバー -->
         <Border DockPanel.Dock="Left" Width="150" Background="#1a1a24" CornerRadius="10" Margin="0,0,12,0" Padding="8">
             <StackPanel>
+                <!-- ゲーム関連機能(ゲーム音声優先モード・ゲームプロファイル)をまとめて表示/非表示する
+                     トップレベルのスイッチ。VC翻訳・OCR翻訳自体はこの設定に関わらず常に使える
+                     (このアプリはゲーム専用ではなく日常用途にも使えることを想定しているため、
+                     ゲームで使わない人には不要な設定項目を隠す)。 -->
+                <CheckBox x:Name="GameModeEnabledCheckBox" Content="ゲームモード" Foreground="#cccccc"
+                          Margin="4,0,4,10" Checked="GameModeEnabledCheckBox_Changed" Unchecked="GameModeEnabledCheckBox_Changed"
+                          ToolTip="ゲーム音声優先モード・ゲームプロファイルの設定項目を表示します"/>
+                <Separator Margin="0,0,0,8" Background="#33ffffff"/>
                 <RadioButton x:Name="NavAudio" GroupName="Nav" Style="{StaticResource NavButton}"
                              Tag="&#xE720;" Content="音声" IsChecked="True" Checked="Nav_Checked"/>
                 <RadioButton x:Name="NavEngine" GroupName="Nav" Style="{StaticResource NavButton}"
@@ -206,22 +214,24 @@
                         <TextBlock Text="小さくするほど、一度話し始めた発話は多少声が小さくなっても『継続中』とみなされやすくなり、息継ぎなどでの意図しない分断を抑えられます。1.0で従来と同じ挙動(単一閾値)になります"
                                    Style="{StaticResource HelpText}"/>
 
-                        <CheckBox x:Name="GameAudioPriorityCheckBox" Content="ゲーム音声優先モード(小さい雑音より大きい音声を優先)"
-                                  Foreground="#cccccc" Margin="0,0,0,8"/>
+                        <StackPanel x:Name="GameAudioPrioritySection">
+                            <CheckBox x:Name="GameAudioPriorityCheckBox" Content="ゲーム音声優先モード(小さい雑音より大きい音声を優先)"
+                                      Foreground="#cccccc" Margin="0,0,0,8"/>
 
-                        <Grid Margin="0,0,0,4">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="優先モードの倍率(VAD閾値に掛ける値)" Style="{StaticResource FieldLabel}"/>
-                            <TextBlock Grid.Column="1" Foreground="#4da6ff" FontWeight="Bold"
-                                       Text="{Binding ElementName=GameAudioPriorityMultiplierSlider, Path=Value, StringFormat='{}{0:F1}倍'}"/>
-                        </Grid>
-                        <Slider x:Name="GameAudioPriorityMultiplierSlider" Minimum="1.0" Maximum="3.0" TickFrequency="0.1"
-                                Value="1.5" IsMoveToPointEnabled="True" Margin="0,0,0,4"/>
-                        <TextBlock Text="以前は1.5倍固定でしたが、環境によって最適な倍率が異なるためここで調整できるようにしました。大きくするほど小さい音(ボイスチャットや環境音を含む)を拾わなくなります"
-                                   Style="{StaticResource HelpText}"/>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="優先モードの倍率(VAD閾値に掛ける値)" Style="{StaticResource FieldLabel}"/>
+                                <TextBlock Grid.Column="1" Foreground="#4da6ff" FontWeight="Bold"
+                                           Text="{Binding ElementName=GameAudioPriorityMultiplierSlider, Path=Value, StringFormat='{}{0:F1}倍'}"/>
+                            </Grid>
+                            <Slider x:Name="GameAudioPriorityMultiplierSlider" Minimum="1.0" Maximum="3.0" TickFrequency="0.1"
+                                    Value="1.5" IsMoveToPointEnabled="True" Margin="0,0,0,4"/>
+                            <TextBlock Text="以前は1.5倍固定でしたが、環境によって最適な倍率が異なるためここで調整できるようにしました。大きくするほど小さい音(ボイスチャットや環境音を含む)を拾わなくなります"
+                                       Style="{StaticResource HelpText}"/>
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
 

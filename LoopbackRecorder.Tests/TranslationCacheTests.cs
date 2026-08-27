@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -92,5 +94,62 @@ public class CachingTranslationServiceTests
         var sut = new CachingTranslationService(inner);
 
         Assert.False(sut.IsEnabled);
+    }
+
+    /// <summary>
+    /// cache stampede対策のregression test。
+    /// 4ワーカーが同時に同じ原文をTranslateAsyncした場合、内側のサービスへの実際の
+    /// 呼び出しは1回だけになるべき(以前の実装では、ワーカー間でcache missが競合し
+    /// 最大4回まで同じ原文がDeepL/Ollamaへ送られていた)。
+    /// 内側のサービスの応答を意図的に遅延させ、4つの呼び出しが確実に「同時に」
+    /// cache missへ到達するようにしてからawaitする。
+    /// </summary>
+    [Fact]
+    public async Task 同じ原文への同時リクエストは内側のサービスを1回しか呼ばない()
+    {
+        var callStarted = new SemaphoreSlim(0);
+        var releaseCall = new TaskCompletionSource();
+        var callCount = 0;
+
+        var inner = new DelayedFakeService(async text =>
+        {
+            Interlocked.Increment(ref callCount);
+            callStarted.Release();
+            await releaseCall.Task; // 全ワーカーが到着するまでここで足止めする
+            return TranslationResult.Success($"訳:{text}");
+        });
+        var sut = new CachingTranslationService(inner);
+
+        const int workerCount = 4;
+        var tasks = new List<Task<TranslationResult>>();
+        for (var i = 0; i < workerCount; i++)
+        {
+            tasks.Add(sut.TranslateAsync("nice", CancellationToken.None));
+        }
+
+        // 最初の1回分の呼び出しが内側サービスに到達するのを待ってから、
+        // 「他のワーカーがまだ来ていないか」を確認する猶予を与える。
+        await callStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+
+        releaseCall.SetResult();
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, r => Assert.Equal("訳:nice", r.Text));
+        Assert.Equal(1, callCount); // 4ワーカー分がすべて1回の呼び出しに集約される
+    }
+
+    private sealed class DelayedFakeService : ITranslationService
+    {
+        private readonly System.Func<string, Task<TranslationResult>> _handler;
+        public bool IsEnabled { get; set; } = true;
+
+        public DelayedFakeService(System.Func<string, Task<TranslationResult>> handler)
+        {
+            _handler = handler;
+        }
+
+        public Task<TranslationResult> TranslateAsync(string text, CancellationToken cancellationToken)
+            => _handler(text);
     }
 }

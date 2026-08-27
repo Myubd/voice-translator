@@ -145,6 +145,9 @@ public partial class SettingsWindow : Window
         UpdateHotkeyDisplays();
         PreviewKeyDown += SettingsWindow_PreviewKeyDown;
 
+        GameModeEnabledCheckBox.IsChecked = Settings.GameModeEnabled;
+        GameModeEnabledCheckBox_Changed(GameModeEnabledCheckBox, new RoutedEventArgs());
+
         // バックエンド選択を復元
         foreach (ComboBoxItem item in BackendComboBox.Items)
         {
@@ -421,9 +424,7 @@ public partial class SettingsWindow : Window
         if (profile == null) return;
 
         ApplyProfileToUiFields(profile);
-        MessageBox.Show(
-            $"プロファイル「{profile.Name}」を読み込みました。実際に反映するには、この設定画面自体を「保存」してください。",
-            "プロファイルを読み込みました", MessageBoxButton.OK, MessageBoxImage.Information);
+        SetStatusMessage($"プロファイル「{profile.Name}」を読み込みました。実際に反映するには、この設定画面自体を「保存」してください。");
     }
 
     private void ProfileDeleteButton_Click(object sender, RoutedEventArgs e)
@@ -448,8 +449,7 @@ public partial class SettingsWindow : Window
         var name = ProfileNewNameTextBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(name))
         {
-            MessageBox.Show("プロファイル名を入力してください。", "プロファイルの保存",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetStatusMessage("プロファイル名を入力してください。");
             return;
         }
 
@@ -475,6 +475,7 @@ public partial class SettingsWindow : Window
         };
 
         GameProfileStore.Upsert(profile);
+        SetStatusMessage("");
         ProfileNewNameTextBox.Text = "";
         RefreshProfileList();
         ProfileListComboBox.SelectedItem = name;
@@ -528,6 +529,29 @@ public partial class SettingsWindow : Window
         if (NavProfiles.IsChecked == true)
         {
             RefreshProfileList();
+        }
+    }
+
+    /// <summary>「ゲームモード」トグルの状態を、ゲーム関連のUI要素(ゲーム音声優先モード・
+    /// ゲームプロファイルのナビ項目とページ)の表示/非表示に反映する。
+    /// OFFにしても値そのもの(GameAudioPriorityCheckBoxのチェック状態や保存済みプロファイル)は
+    /// 消えない。VC翻訳・OCR翻訳の機能はこのトグルと無関係に常に使えるため、対象は
+    /// 「ゲーム専用の設定項目」に限定している。</summary>
+    private void GameModeEnabledCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        // XAMLロード中(コンストラクタでIsChecked設定前に一時的にイベントが飛ぶ可能性がある)は
+        // 要素がまだ無いので何もしない
+        if (GameAudioPrioritySection == null || NavProfiles == null || ProfilesPage == null) return;
+
+        bool enabled = GameModeEnabledCheckBox.IsChecked == true;
+        GameAudioPrioritySection.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+        NavProfiles.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+
+        // ゲームプロファイルタブを表示中にOFFにされた場合、非表示のタブが選択されたままになって
+        // 空白ページを見せ続けることのないよう、音声タブへ切り替える
+        if (!enabled && NavProfiles.IsChecked == true)
+        {
+            NavAudio.IsChecked = true;
         }
     }
 
@@ -674,6 +698,7 @@ public partial class SettingsWindow : Window
         Settings.VadThreshold = (float)VadThresholdSlider.Value;
         Settings.VadHysteresisRatio = (float)VadHysteresisSlider.Value;
         Settings.GameAudioPriorityMode = GameAudioPriorityCheckBox.IsChecked == true;
+        Settings.GameModeEnabled = GameModeEnabledCheckBox.IsChecked == true;
         Settings.GameAudioPriorityMultiplier = (float)GameAudioPriorityMultiplierSlider.Value;
         Settings.OverlayFontSize = OverlayFontSizeSlider.Value;
         Settings.OverlayOpacity = OverlayOpacitySlider.Value;

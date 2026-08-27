@@ -348,4 +348,33 @@ public class FallbackTranslationServiceTests
 
         Assert.False(sut.IsEnabled);
     }
+
+    [Fact]
+    public async Task 主が認証エラーの場合は副にフォールバックせずそのまま返す()
+    {
+        var primary = new FakeService(_ => TranslationResult.AuthFailure("APIキーが正しくありません"));
+        var fallback = new FakeService(_ => TranslationResult.Success("fallback-ok"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Null(result.Text);
+        Assert.Equal("APIキーが正しくありません", result.ErrorMessage);
+        Assert.Equal(0, fallback.CallCount); // 設定ミスがフォールバックで隠れないよう、副は呼ばない
+    }
+
+    [Fact]
+    public async Task 主が利用上限エラーの場合は副にフォールバックしつつ成功結果にも警告を残す()
+    {
+        var primary = new FakeService(_ => TranslationResult.QuotaFailure("DeepLの利用上限に達しました"));
+        var fallback = new FakeService(_ => TranslationResult.Success("fallback-ok"));
+        var sut = new FallbackTranslationService(primary, fallback);
+
+        var result = await sut.TranslateAsync("hello", CancellationToken.None);
+
+        Assert.Equal("fallback-ok", result.Text); // 訳文自体は問題なく返る
+        Assert.Equal(1, fallback.CallCount); // 429/456は401/403と違いフォールバックを続ける
+        Assert.NotNull(result.Warning);
+        Assert.Contains("DeepLの利用上限に達しました", result.Warning);
+    }
 }
